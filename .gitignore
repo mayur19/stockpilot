@@ -1,0 +1,15 @@
+node_modules/
+dist/
+coverage/
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+**/uploads/*
+!**/uploads/.gitkeep
+e2e/report/
+e2e/test-results/
+.run/
+.idea/
+.vscode/

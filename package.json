@@ -1,0 +1,40 @@
+{
+  "name": "stockpilot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "StockPilot warehouse management system",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "dev": "concurrently -k -n api,web -c blue,magenta \"npm:dev -w @stockpilot/api\" \"npm:dev -w @stockpilot/web\"",
+    "build": "npm run build -w @stockpilot/api && npm run build -w @stockpilot/web",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "npm run test --workspaces --if-present",
+    "test:coverage": "npm run test:coverage --workspaces --if-present",
+    "test:e2e": "playwright test --config e2e/playwright.config.ts",
+    "db:migrate": "npm run db:migrate -w @stockpilot/api",
+    "db:seed": "npm run db:seed -w @stockpilot/api",
+    "db:reset": "npm run db:reset -w @stockpilot/api"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.17.0",
+    "@playwright/test": "^1.49.1",
+    "concurrently": "^9.1.2",
+    "eslint": "^9.17.0",
+    "eslint-plugin-react-hooks": "^5.1.0",
+    "globals": "^15.14.0",
+    "prettier": "^3.4.2",
+    "typescript": "^5.7.2",
+    "typescript-eslint": "^8.19.0"
+  }
+}

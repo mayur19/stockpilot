@@ -1,0 +1,33 @@
+{
+  "name": "@stockpilot/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch --env-file-if-exists=../../.env src/index.ts",
+    "build": "tsup src/index.ts src/db/cli.ts --format esm --target node22 --clean --sourcemap",
+    "start": "node --env-file-if-exists=../../.env dist/index.js",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "db:migrate": "tsx --env-file-if-exists=../../.env src/db/cli.ts migrate",
+    "db:seed": "tsx --env-file-if-exists=../../.env src/db/cli.ts seed",
+    "db:reset": "tsx --env-file-if-exists=../../.env src/db/cli.ts reset"
+  },
+  "dependencies": {
+    "@fastify/cookie": "^11.0.2",
+    "@stockpilot/shared": "0.1.0",
+    "fastify": "^5.2.0",
+    "pg": "^8.13.1",
+    "pino": "^9.6.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/pg": "^8.11.10",
+    "@vitest/coverage-v8": "^3.2.4",
+    "tsup": "^8.3.5",
+    "tsx": "^4.19.2",
+    "vitest": "^3.2.4"
+  }
+}
