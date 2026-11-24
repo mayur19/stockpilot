@@ -1,0 +1,4034 @@
+openapi: 3.1.0
+info:
+  title: StockPilot API
+  version: 0.1.0
+  summary: Warehouse management system API (topology, catalogue, event-sourced inventory ledger, allocation).
+  description: >-
+    Full target API of StockPilot. Every operation carries `x-status`. Operations with
+    `x-status: implemented` are live in `apps/api` and covered by tests. Operations with
+    `x-status: pending` are registered by `apps/api/src/modules/pending/pending.catalog.ts`;
+    they require a session (and the CSRF header when mutating) and then answer
+    `501 NOT_IMPLEMENTED` with `error.details.ticket` set to the backlog ticket in
+    `x-ticket` (see docs/planning/backlog.md). The request and response schemas of pending
+    operations describe the planned contract and may still change before the ticket ships.
+
+
+    Every response body uses the envelope `{ data, error, meta? }`; see docs/api/README.md
+    for conventions, error codes, pagination, authentication and curl examples.
+  license:
+    name: MIT
+    identifier: MIT
+servers:
+  - url: http://127.0.0.1:4103
+    description: Local API started by ./run.sh (API_HOST / API_PORT)
+  - url: http://localhost:5103
+    description: Local web dev server; proxies /api to the API (same-origin cookies)
+security:
+  - sessionCookie: []
+tags:
+  - name: Health
+    description: Liveness and readiness probes.
+  - name: Auth
+    description: Registration, sessions, CSRF.
+  - name: Users & roles
+    description: User management, roles, 3PL clients, audit log.
+  - name: Topology
+    description: Warehouses, zones and bins.
+  - name: Catalogue
+    description: SKUs, units-of-measure ladders, lots, serials.
+  - name: Inventory
+    description: Append-only movement ledger and on-hand projection.
+  - name: Allocation
+    description: FEFO / FIFO / LIFO reservation of stock against orders.
+  - name: Inbound
+    description: ASNs, receiving and quality inspection.
+  - name: Putaway & slotting
+    description: Directed putaway and velocity slotting.
+  - name: Outbound
+    description: Outbound orders and waves.
+  - name: Picking
+    description: Pick paths and pick tasks.
+  - name: Packing & shipping
+    description: Cartonization, pack stations, shipments, manifests, carrier rates.
+  - name: Counting
+    description: Cycle counting.
+  - name: Replenishment
+    description: Pick-face replenishment.
+  - name: Returns
+    description: Return authorisations and returns receiving.
+  - name: Labels
+    description: Barcodes and printable labels.
+  - name: Reporting
+    description: Dashboards, reports, notifications, billing, metrics.
+
+paths:
+  # ---------------------------------------------------------------- Health
+  /api/v1/health:
+    get:
+      tags: [Health]
+      operationId: getHealth
+      summary: Liveness probe
+      x-status: implemented
+      x-ticket: SP-003
+      security: []
+      responses:
+        '200':
+          description: Process is up.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/Health' } }
+  /api/v1/ready:
+    get:
+      tags: [Health]
+      operationId: getReady
+      summary: Readiness probe (database reachable and migrated)
+      x-status: implemented
+      x-ticket: SP-003
+      security: []
+      responses:
+        '200':
+          description: Database reachable; `migrations` is the number of applied migrations.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/Ready' } }
+        '503':
+          description: '`NOT_READY`: database unavailable or `schema_migrations` missing.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  # ---------------------------------------------------------------- Auth
+  /api/v1/auth/register:
+    post:
+      tags: [Auth]
+      operationId: registerOwner
+      summary: Register an organisation and its owner account
+      description: >-
+        Always answers `202` with the same generic body whether or not the email is
+        already registered, and never sets cookies, so the endpoint cannot be used to
+        enumerate accounts. The caller signs in afterwards with `/auth/login`.
+        Throttled per client IP (`REGISTER_IP_MAX_ATTEMPTS` per hour).
+      x-status: implemented
+      x-ticket: SP-010
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RegisterRequest' }
+      responses:
+        '202':
+          description: Accepted (generic, non-enumerating).
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/RegisterAccepted' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /api/v1/auth/login:
+    post:
+      tags: [Auth]
+      operationId: login
+      summary: Sign in and receive session + CSRF cookies
+      description: >-
+        On success sets `sp_session` (HttpOnly, SameSite=Lax, Secure in production) and
+        `sp_csrf` (readable by the SPA) and returns the CSRF token in the body. Failures
+        answer `401 INVALID_CREDENTIALS` without saying whether the email exists.
+        Throttled by a per-email progressive backoff, a per-IP failure window across all
+        emails and a cap on distinct emails per client IP (`LOGIN_IP_MAX_EMAILS` per IPv4
+        address or IPv6 /64, and 4x that per IPv6 /48). Attempts are reserved before any I/O, so a concurrent burst
+        gets `429` as soon as the limit is reached.
+      x-status: implemented
+      x-ticket: SP-010
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoginRequest' }
+      responses:
+        '200':
+          description: Signed in.
+          headers:
+            Set-Cookie:
+              description: '`sp_session=<token>; HttpOnly; SameSite=Lax; Path=/` and `sp_csrf=<token>; SameSite=Lax; Path=/`'
+              schema: { type: string }
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/LoginResult' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/InvalidCredentials' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /api/v1/auth/logout:
+    post:
+      tags: [Auth]
+      operationId: logout
+      summary: Sign out (deletes the server-side session)
+      x-status: implemented
+      x-ticket: SP-010
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/CsrfToken'
+      responses:
+        '204':
+          description: Session deleted; both cookies cleared.
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /api/v1/auth/me:
+    get:
+      tags: [Auth]
+      operationId: getMe
+      summary: Current user, organisation and CSRF token
+      x-status: implemented
+      x-ticket: SP-010
+      x-permission: authenticated
+      responses:
+        '200':
+          description: The signed-in user.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/MeResult' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+  /api/v1/auth/verify-email:
+    post:
+      tags: [Auth]
+      operationId: verifyEmail
+      summary: Confirm an email address with a token delivered through the local outbox
+      x-status: pending
+      x-ticket: SP-009
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/CsrfToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/VerifyEmailRequest' }
+      responses:
+        '200':
+          description: Email verified.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/VerifyEmailResult' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /api/v1/auth/password-reset:
+    post:
+      tags: [Auth]
+      operationId: requestPasswordReset
+      summary: Request or complete a password reset via the local outbox
+      x-status: pending
+      x-ticket: SP-017
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/CsrfToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PasswordResetRequest' }
+      responses:
+        '202':
+          description: Generic acknowledgement (does not reveal whether the email exists).
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/RegisterAccepted' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+
+  # ---------------------------------------------------------------- Users & roles
+  /api/v1/users:
+    get:
+      tags: [Users & roles]
+      operationId: listUsers
+      summary: List users of the organisation
+      x-status: pending
+      x-ticket: SP-015
+      x-permission: authenticated
+      responses:
+        '200':
+          description: Users.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      { data: { type: array, items: { $ref: '#/components/schemas/User' } } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /api/v1/users/invitations:
+    post:
+      tags: [Users & roles]
+      operationId: inviteUser
+      summary: Invite a user (invitation delivered through the local outbox)
+      x-status: pending
+      x-ticket: SP-015
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/CsrfToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/InvitationRequest' }
+      responses:
+        '201':
+          description: Invitation created.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/Invitation' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /api/v1/users/{userId}:
+    patch:
+      tags: [Users & roles]
+      operationId: updateUser
+      summary: Change a user's role or deactivate the user
+      x-status: pending
+      x-ticket: SP-015
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/UserIdPath'
+        - $ref: '#/components/parameters/CsrfToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UserPatch' }
+      responses:
+        '200':
+          description: Updated user.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/User' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /api/v1/roles:
+    get:
+      tags: [Users & roles]
+      operationId: listRoles
+      summary: List built-in and custom roles with their permissions
+      x-status: pending
+      x-ticket: SP-016
+      x-permission: authenticated
+      responses:
+        '200':
+          description: Roles.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      {
+                        data:
+                          { type: array, items: { $ref: '#/components/schemas/RoleDefinition' } },
+                      }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /api/v1/clients:
+    get:
+      tags: [Users & roles]
+      operationId: listClients
+      summary: List 3PL client accounts
+      x-status: pending
+      x-ticket: SP-018
+      x-permission: authenticated
+      responses:
+        '200':
+          description: Clients.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      { data: { type: array, items: { $ref: '#/components/schemas/Client' } } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /api/v1/audit-events:
+    get:
+      tags: [Users & roles]
+      operationId: listAuditEvents
+      summary: Browse the audit log (keyset paginated)
+      x-status: pending
+      x-ticket: SP-019
+      x-permission: authenticated
+      parameters:
+        - { name: before, in: query, required: false, schema: { type: integer, minimum: 1 } }
+        - { name: action, in: query, required: false, schema: { type: string, maxLength: 64 } }
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Audit events, newest first.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data: { type: array, items: { $ref: '#/components/schemas/AuditEvent' } }
+                      meta: { $ref: '#/components/schemas/CursorMeta' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+
+  # ---------------------------------------------------------------- Topology
+  /api/v1/warehouses:
+    get:
+      tags: [Topology]
+      operationId: listWarehouses
+      summary: List warehouses (ordered by code)
+      x-status: implemented
+      x-ticket: SP-020
+      x-permission: topology:read
+      responses:
+        '200':
+          description: Warehouses of the caller's organisation.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      { data: { type: array, items: { $ref: '#/components/schemas/Warehouse' } } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Topology]
+      operationId: createWarehouse
+      summary: Create a warehouse
+      description: >-
+        `timezone` is canonicalised to its IANA name (e.g. `europe/london` is stored as
+        `Europe/London`); unknown zones are rejected with `VALIDATION_FAILED`.
+      x-status: implemented
+      x-ticket: SP-020
+      x-permission: topology:write
+      parameters:
+        - $ref: '#/components/parameters/CsrfToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateWarehouseRequest' }
+      responses:
+        '201':
+          description: Created.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/Warehouse' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /api/v1/warehouses/{warehouseId}:
+    parameters:
+      - $ref: '#/components/parameters/WarehouseIdPath'
+    get:
+      tags: [Topology]
+      operationId: getWarehouse
+      summary: Get one warehouse
+      x-status: implemented
+      x-ticket: SP-020
+      x-permission: topology:read
+      responses:
+        '200':
+          description: The warehouse.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/Warehouse' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Topology]
+      operationId: updateWarehouse
+      summary: Update or deactivate a warehouse
+      x-status: pending
+      x-ticket: SP-024
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/CsrfToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WarehousePatch' }
+      responses:
+        '200':
+          description: Updated warehouse.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/Warehouse' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /api/v1/warehouses/{warehouseId}/zones:
+    parameters:
+      - $ref: '#/components/parameters/WarehouseIdPath'
+    get:
+      tags: [Topology]
+      operationId: listZones
+      summary: List zones of a warehouse (ordered by code)
+      x-status: implemented
+      x-ticket: SP-020
+      x-permission: topology:read
+      responses:
+        '200':
+          description: Zones.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      { data: { type: array, items: { $ref: '#/components/schemas/Zone' } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      tags: [Topology]
+      operationId: createZone
+      summary: Create a zone
+      x-status: implemented
+      x-ticket: SP-020
+      x-permission: topology:write
+      parameters:
+        - $ref: '#/components/parameters/CsrfToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateZoneRequest' }
+      responses:
+        '201':
+          description: Created.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/Zone' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /api/v1/warehouses/{warehouseId}/bins:
+    parameters:
+      - $ref: '#/components/parameters/WarehouseIdPath'
+    get:
+      tags: [Topology]
+      operationId: listBins
+      summary: List bins in walk order (pick sequence, then code)
+      x-status: implemented
+      x-ticket: SP-020
+      x-permission: topology:read
+      parameters:
+        - name: zoneId
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/Uuid' }
+      responses:
+        '200':
+          description: Bins.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      { data: { type: array, items: { $ref: '#/components/schemas/Bin' } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      tags: [Topology]
+      operationId: createBin
+      summary: Create a bin
+      description: >-
+        `code` is parsed as `ZONE-AA-RR-L-P` (e.g. `A-03-12-2-B`) or a free-form staging
+        code (`RCV01`, 2-16 characters, letter first) and stored upper-cased. When
+        `pickSequence` is omitted it is derived from the address with a serpentine
+        walk (odd aisles ascending, even aisles descending); free-form bins get 0.
+        Invalid codes answer `400 INVALID_BIN_CODE`; an unknown zone answers `404`.
+      x-status: implemented
+      x-ticket: SP-020
+      x-permission: topology:write
+      parameters:
+        - $ref: '#/components/parameters/CsrfToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateBinRequest' }
+      responses:
+        '201':
+          description: Created.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/Bin' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /api/v1/warehouses/{warehouseId}/bins/{binId}:
+    patch:
+      tags: [Topology]
+      operationId: updateBin
+      summary: Update or deactivate a bin
+      x-status: pending
+      x-ticket: SP-024
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/WarehouseIdPath'
+        - $ref: '#/components/parameters/BinIdPath'
+        - $ref: '#/components/parameters/CsrfToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BinPatch' }
+      responses:
+        '200':
+          description: Updated bin.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/Bin' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /api/v1/warehouses/{warehouseId}/bins/import:
+    post:
+      tags: [Topology]
+      operationId: importBins
+      summary: Bulk-import zones and bins from CSV
+      x-status: pending
+      x-ticket: SP-021
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/WarehouseIdPath'
+        - $ref: '#/components/parameters/CsrfToken'
+      requestBody:
+        required: true
+        content:
+          text/csv:
+            schema:
+              type: string
+              description: 'Header row `zone_code,bin_code,pick_sequence,max_weight_g,max_volume_cm3`.'
+      responses:
+        '200':
+          description: Import report (all-or-nothing; rows with errors abort the import).
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/ImportReport' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /api/v1/warehouses/{warehouseId}/map:
+    get:
+      tags: [Topology]
+      operationId: getWarehouseMap
+      summary: Warehouse layout for SVG map rendering
+      x-status: pending
+      x-ticket: SP-023
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/WarehouseIdPath'
+      responses:
+        '200':
+          description: Layout.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/WarehouseMap' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+
+  # ---------------------------------------------------------------- Catalogue
+  /api/v1/skus:
+    get:
+      tags: [Catalogue]
+      operationId: listSkus
+      summary: List SKUs (ordered by code, at most 200)
+      x-status: implemented
+      x-ticket: SP-030
+      x-permission: catalog:read
+      parameters:
+        - name: search
+          in: query
+          required: false
+          description: Case-insensitive substring match on code or description.
+          schema: { type: string, minLength: 1, maxLength: 64 }
+      responses:
+        '200':
+          description: SKUs.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      {
+                        data:
+                          {
+                            type: array,
+                            maxItems: 200,
+                            items: { $ref: '#/components/schemas/Sku' },
+                          },
+                      }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Catalogue]
+      operationId: createSku
+      summary: Create a SKU with a nested unit-of-measure ladder
+      description: >-
+        Each level's factor must be a whole multiple (>= 2x) of the level below it
+        (e.g. CS=12, PL=480). Bad ladders answer `400 INVALID_UOM_LADDER`.
+        `expiryTracked` requires `lotTracked` (`400 VALIDATION_FAILED`).
+      x-status: implemented
+      x-ticket: SP-030
+      x-permission: catalog:write
+      parameters:
+        - $ref: '#/components/parameters/CsrfToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateSkuRequest' }
+      responses:
+        '201':
+          description: Created.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/Sku' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /api/v1/skus/import:
+    post:
+      tags: [Catalogue]
+      operationId: importSkus
+      summary: Import the SKU catalogue from CSV
+      x-status: pending
+      x-ticket: SP-033
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/CsrfToken'
+      requestBody:
+        required: true
+        content:
+          text/csv:
+            schema:
+              type: string
+              description: 'Header row `code,description,base_uom,uom_levels,lot_tracked,expiry_tracked,default_strategy`; `uom_levels` like `CS:12|PL:480`.'
+      responses:
+        '200':
+          description: Import report.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/ImportReport' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /api/v1/skus/{skuId}:
+    parameters:
+      - $ref: '#/components/parameters/SkuIdPath'
+    get:
+      tags: [Catalogue]
+      operationId: getSku
+      summary: Get one SKU
+      x-status: implemented
+      x-ticket: SP-030
+      x-permission: catalog:read
+      responses:
+        '200':
+          description: The SKU.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/Sku' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Catalogue]
+      operationId: updateSku
+      summary: Update a SKU; UoM ladder changes create a new ladder version
+      x-status: pending
+      x-ticket: SP-035
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/CsrfToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SkuPatch' }
+      responses:
+        '200':
+          description: Updated SKU.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/Sku' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /api/v1/skus/{skuId}/lots:
+    get:
+      tags: [Catalogue]
+      operationId: listLots
+      summary: List lots of a SKU (earliest expiry first, then oldest receipt)
+      x-status: implemented
+      x-ticket: SP-031
+      x-permission: catalog:read
+      parameters:
+        - $ref: '#/components/parameters/SkuIdPath'
+      responses:
+        '200':
+          description: Lots.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      { data: { type: array, items: { $ref: '#/components/schemas/Lot' } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/v1/skus/{skuId}/serials:
+    get:
+      tags: [Catalogue]
+      operationId: listSerials
+      summary: List serial numbers of a serial-tracked SKU
+      x-status: pending
+      x-ticket: SP-032
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/SkuIdPath'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Serials.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      { data: { type: array, items: { $ref: '#/components/schemas/Serial' } } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+
+  # ---------------------------------------------------------------- Inventory
+  /api/v1/inventory/receipts:
+    post:
+      tags: [Inventory]
+      operationId: receiveStock
+      summary: Receive stock into a bin (RECEIPT movement)
+      description: >-
+        `quantity` is a whole number in `uom` (default: the SKU's base unit) and is
+        converted to base units with the SKU ladder. Lot-tracked SKUs require `lotCode`;
+        expiry-tracked SKUs require `expiryDate`; untracked SKUs must omit both and get
+        a system lot `AUTO-YYYYMMDD` (warehouse-local date). Receiving an existing lot
+        with a different expiry answers `409 LOT_EXPIRY_MISMATCH`.
+      x-status: implemented
+      x-ticket: SP-040
+      x-permission: inventory:receive
+      parameters:
+        - $ref: '#/components/parameters/CsrfToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReceiptRequest' }
+      responses:
+        '201':
+          description: Movement appended and projection updated in one transaction.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/ReceiptResult' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '503': { $ref: '#/components/responses/ConcurrencyRetry' }
+  /api/v1/inventory/moves:
+    post:
+      tags: [Inventory]
+      operationId: moveStock
+      summary: Move stock of one lot between two bins (MOVE movement)
+      description: >-
+        Only available (on hand minus allocated) units can leave the source bin;
+        otherwise `409 INSUFFICIENT_AVAILABLE`. Source and destination must differ.
+      x-status: implemented
+      x-ticket: SP-040
+      x-permission: inventory:move
+      parameters:
+        - $ref: '#/components/parameters/CsrfToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MoveRequest' }
+      responses:
+        '201':
+          description: Movement appended; both affected balances returned.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/MoveResult' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '503': { $ref: '#/components/responses/ConcurrencyRetry' }
+  /api/v1/inventory/adjustments:
+    post:
+      tags: [Inventory]
+      operationId: adjustStock
+      summary: Adjust stock with a reason code (ADJUST_IN / ADJUST_OUT movement)
+      description: >-
+        `delta` is a signed whole number of base units. Negative adjustments can only
+        remove available units (`409 INSUFFICIENT_AVAILABLE`).
+      x-status: implemented
+      x-ticket: SP-040
+      x-permission: inventory:adjust
+      parameters:
+        - $ref: '#/components/parameters/CsrfToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AdjustmentRequest' }
+      responses:
+        '201':
+          description: Movement appended.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/AdjustmentResult' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '503': { $ref: '#/components/responses/ConcurrencyRetry' }
+  /api/v1/inventory/balances:
+    get:
+      tags: [Inventory]
+      operationId: listBalances
+      summary: Stock on hand by bin and lot (projection)
+      description: Ordered by bin pick sequence, bin code, SKU code, expiry (nulls last), lot code.
+      x-status: implemented
+      x-ticket: SP-041
+      x-permission: inventory:read
+      parameters:
+        - $ref: '#/components/parameters/WarehouseIdQuery'
+        - { name: skuId, in: query, required: false, schema: { $ref: '#/components/schemas/Uuid' } }
+        - { name: binId, in: query, required: false, schema: { $ref: '#/components/schemas/Uuid' } }
+        - name: includeEmpty
+          in: query
+          required: false
+          description: Include rows whose on-hand is zero.
+          schema: { type: string, enum: ['true', 'false'], default: 'false' }
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Balance rows.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data: { type: array, items: { $ref: '#/components/schemas/BalanceRow' } }
+                      meta: { $ref: '#/components/schemas/CountMeta' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/v1/inventory/balances/as-of:
+    get:
+      tags: [Inventory]
+      operationId: listBalancesAsOf
+      summary: Point-in-time stock by ledger replay from the nearest snapshot
+      x-status: pending
+      x-ticket: SP-043
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/WarehouseIdQuery'
+        - { name: at, in: query, required: true, schema: { type: string, format: date-time } }
+        - { name: skuId, in: query, required: false, schema: { $ref: '#/components/schemas/Uuid' } }
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Balances as they were at `at`.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data: { type: array, items: { $ref: '#/components/schemas/BalanceRow' } }
+                      meta:
+                        type: object
+                        properties:
+                          at: { type: string, format: date-time }
+                          replayedFromMovementId: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /api/v1/inventory/movements:
+    get:
+      tags: [Inventory]
+      operationId: listMovements
+      summary: Ledger entries, newest first, keyset paginated
+      description: >-
+        Pass `meta.nextCursor` from the previous page as `before` to get the next
+        (older) page. `nextCursor` is null when the page was not full.
+        `binId` matches either the source or the destination bin.
+      x-status: implemented
+      x-ticket: SP-040
+      x-permission: inventory:read
+      parameters:
+        - $ref: '#/components/parameters/WarehouseIdQuery'
+        - { name: skuId, in: query, required: false, schema: { $ref: '#/components/schemas/Uuid' } }
+        - { name: binId, in: query, required: false, schema: { $ref: '#/components/schemas/Uuid' } }
+        - name: before
+          in: query
+          required: false
+          description: Return movements with `id` strictly less than this cursor.
+          schema: { type: integer, minimum: 1 }
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Movements.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data: { type: array, items: { $ref: '#/components/schemas/Movement' } }
+                      meta: { $ref: '#/components/schemas/CursorMeta' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/v1/inventory/projection/verify:
+    get:
+      tags: [Inventory]
+      operationId: verifyProjection
+      summary: Replay the whole ledger and compare it with stored balances
+      description: >-
+        Organisation-wide. Folds every movement in id order with the shared domain
+        `projectBalances` and diffs the result against `stock_balances`, ignoring rows
+        that are zero on both sides. Read-only; it never repairs anything.
+      x-status: implemented
+      x-ticket: SP-041
+      x-permission: inventory:verify
+      responses:
+        '200':
+          description: Verification report.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/ProjectionReport' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /api/v1/inventory/holds:
+    post:
+      tags: [Inventory]
+      operationId: createHold
+      summary: Place stock on hold (quarantine, damaged, QA)
+      x-status: pending
+      x-ticket: SP-042
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/CsrfToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/HoldRequest' }
+      responses:
+        '201':
+          description: Hold created; held units become unallocatable.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/Hold' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /api/v1/inventory/snapshots:
+    post:
+      tags: [Inventory]
+      operationId: createSnapshot
+      summary: Write a ledger snapshot used to bound replay cost
+      x-status: pending
+      x-ticket: SP-044
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/CsrfToken'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                warehouseId: { $ref: '#/components/schemas/Uuid' }
+      responses:
+        '201':
+          description: Snapshot written.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/LedgerSnapshot' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+
+  # ---------------------------------------------------------------- Allocation
+  /api/v1/allocations:
+    get:
+      tags: [Allocation]
+      operationId: listAllocations
+      summary: List allocations of a warehouse, newest first
+      x-status: implemented
+      x-ticket: SP-051
+      x-permission: allocation:read
+      parameters:
+        - $ref: '#/components/parameters/WarehouseIdQuery'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Allocation headers (without lines).
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      {
+                        data:
+                          { type: array, items: { $ref: '#/components/schemas/AllocationHeader' } },
+                      }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      tags: [Allocation]
+      operationId: createAllocation
+      summary: Allocate an order against available stock
+      description: >-
+        In one transaction: lock every candidate balance row for the requested SKUs
+        (ordered by SKU then row id, `FOR UPDATE`), plan in pure code with the chosen
+        strategy (request `strategy` overrides each SKU's `defaultStrategy`), persist
+        lines and picks, and append one `ALLOCATE` ledger entry per pick. Only bins in
+        active STORAGE or PICK zones are candidates; expired, held and short-shelf-life
+        lots are excluded. With `shipComplete=false` a partial result is stored with
+        status `PARTIAL`; when nothing (or, with `shipComplete=true`, not everything)
+        can be allocated the request fails with `409 INSUFFICIENT_STOCK`. A second live
+        allocation for the same `orderRef` in the warehouse answers `409 ALREADY_EXISTS`.
+      x-status: implemented
+      x-ticket: SP-051
+      x-permission: allocation:write
+      parameters:
+        - $ref: '#/components/parameters/CsrfToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AllocationRequest' }
+      responses:
+        '201':
+          description: Allocation created (status ALLOCATED or PARTIAL).
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/Allocation' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: '`INSUFFICIENT_STOCK` (details.lines carry per-line shortfall) or `ALREADY_EXISTS`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+              examples:
+                insufficient:
+                  value:
+                    data: null
+                    error:
+                      code: INSUFFICIENT_STOCK
+                      message: Not enough eligible stock to allocate this order
+                      details:
+                        lines:
+                          - {
+                              lineNo: 1,
+                              skuId: 3f0c6c1e-6a43-4c55-9d1f-5a1f0b8b2a10,
+                              requested: 60,
+                              shortfall: 21,
+                              excluded: 2,
+                            }
+        '503': { $ref: '#/components/responses/ConcurrencyRetry' }
+  /api/v1/allocations/{allocationId}:
+    get:
+      tags: [Allocation]
+      operationId: getAllocation
+      summary: Get an allocation with lines and picks
+      x-status: implemented
+      x-ticket: SP-051
+      x-permission: allocation:read
+      parameters:
+        - $ref: '#/components/parameters/AllocationIdPath'
+      responses:
+        '200':
+          description: The allocation; picks are ordered by bin walk sequence.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/Allocation' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/v1/allocations/{allocationId}/release:
+    post:
+      tags: [Allocation]
+      operationId: releaseAllocation
+      summary: Release an allocation (compensating DEALLOCATE entries)
+      description: >-
+        Returns every reserved unit to available stock by appending one `DEALLOCATE`
+        movement per pick and marks the allocation `RELEASED`. A second release answers
+        `409 ALREADY_RELEASED`. No request body is needed.
+      x-status: implemented
+      x-ticket: SP-055
+      x-permission: allocation:write
+      parameters:
+        - $ref: '#/components/parameters/AllocationIdPath'
+        - $ref: '#/components/parameters/CsrfToken'
+      responses:
+        '200':
+          description: Released allocation.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/Allocation' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '503': { $ref: '#/components/responses/ConcurrencyRetry' }
+
+  # ---------------------------------------------------------------- Inbound
+  /api/v1/asns:
+    get:
+      tags: [Inbound]
+      operationId: listAsns
+      summary: List advance shipping notices
+      x-status: pending
+      x-ticket: SP-070
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/WarehouseIdQuery'
+        - name: status
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/AsnStatus' }
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: ASNs.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      { data: { type: array, items: { $ref: '#/components/schemas/Asn' } } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+    post:
+      tags: [Inbound]
+      operationId: createAsn
+      summary: Create an ASN
+      x-status: pending
+      x-ticket: SP-070
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/CsrfToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateAsnRequest' }
+      responses:
+        '201':
+          description: ASN created in status EXPECTED.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/Asn' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /api/v1/asns/{asnId}/receipts:
+    post:
+      tags: [Inbound]
+      operationId: receiveAgainstAsn
+      summary: Receive a line of an ASN (appends RECEIPT movements)
+      x-status: pending
+      x-ticket: SP-071
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/AsnIdPath'
+        - $ref: '#/components/parameters/CsrfToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AsnReceiptRequest' }
+      responses:
+        '201':
+          description: Received; returns updated ASN line progress.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/AsnLine' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /api/v1/asns/{asnId}/close:
+    post:
+      tags: [Inbound]
+      operationId: closeAsn
+      summary: Close an ASN and produce its discrepancy report
+      x-status: pending
+      x-ticket: SP-071
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/AsnIdPath'
+        - $ref: '#/components/parameters/CsrfToken'
+      responses:
+        '200':
+          description: Closed ASN with over/short/damaged lines.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/AsnDiscrepancyReport' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /api/v1/inspections:
+    post:
+      tags: [Inbound]
+      operationId: recordInspection
+      summary: Record a quality inspection outcome for received stock
+      x-status: pending
+      x-ticket: SP-073
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/CsrfToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/InspectionRequest' }
+      responses:
+        '201':
+          description: Inspection recorded; failed stock is moved to quarantine and held.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/Inspection' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+
+  # ---------------------------------------------------------------- Putaway & slotting
+  /api/v1/putaway/suggestions:
+    post:
+      tags: [Putaway & slotting]
+      operationId: suggestPutaway
+      summary: Suggest destination bins for received stock (rules + capacity)
+      x-status: pending
+      x-ticket: SP-080
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/CsrfToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PutawaySuggestionRequest' }
+      responses:
+        '200':
+          description: Ranked suggestions.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      {
+                        data:
+                          {
+                            type: array,
+                            items: { $ref: '#/components/schemas/PutawaySuggestion' },
+                          },
+                      }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /api/v1/putaway/tasks:
+    get:
+      tags: [Putaway & slotting]
+      operationId: listPutawayTasks
+      summary: List open putaway tasks
+      x-status: pending
+      x-ticket: SP-081
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/WarehouseIdQuery'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Tasks.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      { data: { type: array, items: { $ref: '#/components/schemas/PutawayTask' } } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /api/v1/putaway/tasks/{taskId}/confirm:
+    post:
+      tags: [Putaway & slotting]
+      operationId: confirmPutawayTask
+      summary: Confirm a putaway task (appends a MOVE movement)
+      x-status: pending
+      x-ticket: SP-081
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/TaskIdPath'
+        - $ref: '#/components/parameters/CsrfToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TaskConfirmRequest' }
+      responses:
+        '200':
+          description: Task completed.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/PutawayTask' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /api/v1/slotting/recommendations:
+    get:
+      tags: [Putaway & slotting]
+      operationId: listSlottingRecommendations
+      summary: ABC velocity slotting recommendations
+      x-status: pending
+      x-ticket: SP-082
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/WarehouseIdQuery'
+        - {
+            name: days,
+            in: query,
+            required: false,
+            schema: { type: integer, minimum: 7, maximum: 365, default: 90 },
+          }
+      responses:
+        '200':
+          description: Recommendations ordered by expected travel saving.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      {
+                        data:
+                          {
+                            type: array,
+                            items: { $ref: '#/components/schemas/SlottingRecommendation' },
+                          },
+                      }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+
+  # ---------------------------------------------------------------- Outbound
+  /api/v1/orders:
+    get:
+      tags: [Outbound]
+      operationId: listOrders
+      summary: List outbound orders
+      x-status: pending
+      x-ticket: SP-090
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/WarehouseIdQuery'
+        - {
+            name: status,
+            in: query,
+            required: false,
+            schema: { $ref: '#/components/schemas/OrderStatus' },
+          }
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Orders.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      { data: { type: array, items: { $ref: '#/components/schemas/Order' } } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+    post:
+      tags: [Outbound]
+      operationId: createOrder
+      summary: Create an outbound order
+      x-status: pending
+      x-ticket: SP-090
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/CsrfToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateOrderRequest' }
+      responses:
+        '201':
+          description: Order created in status NEW.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/Order' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /api/v1/orders/{orderId}/cancel:
+    post:
+      tags: [Outbound]
+      operationId: cancelOrder
+      summary: Cancel an order (releases its allocation)
+      x-status: pending
+      x-ticket: SP-091
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/OrderIdPath'
+        - $ref: '#/components/parameters/CsrfToken'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                reason: { type: string, maxLength: 240 }
+      responses:
+        '200':
+          description: Order cancelled.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/Order' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /api/v1/waves:
+    get:
+      tags: [Outbound]
+      operationId: listWaves
+      summary: List waves
+      x-status: pending
+      x-ticket: SP-092
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/WarehouseIdQuery'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Waves.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      { data: { type: array, items: { $ref: '#/components/schemas/Wave' } } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+    post:
+      tags: [Outbound]
+      operationId: createWave
+      summary: Plan a wave by carrier cut-off and zone
+      x-status: pending
+      x-ticket: SP-092
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/CsrfToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateWaveRequest' }
+      responses:
+        '201':
+          description: Wave planned.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/Wave' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /api/v1/waves/{waveId}/release:
+    post:
+      tags: [Outbound]
+      operationId: releaseWave
+      summary: Release a wave (allocates its orders and creates pick tasks)
+      x-status: pending
+      x-ticket: SP-093
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/WaveIdPath'
+        - $ref: '#/components/parameters/CsrfToken'
+      responses:
+        '200':
+          description: Wave released.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/WaveReleaseResult' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+
+  # ---------------------------------------------------------------- Picking
+  /api/v1/pick-paths:
+    post:
+      tags: [Picking]
+      operationId: optimisePickPath
+      summary: Order a set of pick locations into a short walk
+      x-status: pending
+      x-ticket: SP-100
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/CsrfToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PickPathRequest' }
+      responses:
+        '200':
+          description: Ordered route.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/PickPathResult' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /api/v1/pick-tasks:
+    get:
+      tags: [Picking]
+      operationId: listPickTasks
+      summary: List pick tasks
+      x-status: pending
+      x-ticket: SP-101
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/WarehouseIdQuery'
+        - {
+            name: waveId,
+            in: query,
+            required: false,
+            schema: { $ref: '#/components/schemas/Uuid' },
+          }
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Tasks in route order.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      { data: { type: array, items: { $ref: '#/components/schemas/PickTask' } } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /api/v1/pick-tasks/{taskId}/confirm:
+    post:
+      tags: [Picking]
+      operationId: confirmPickTask
+      summary: Confirm a pick (scan-verified bin, lot and quantity)
+      x-status: pending
+      x-ticket: SP-101
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/TaskIdPath'
+        - $ref: '#/components/parameters/CsrfToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TaskConfirmRequest' }
+      responses:
+        '200':
+          description: Task picked.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/PickTask' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /api/v1/pick-tasks/{taskId}/short:
+    post:
+      tags: [Picking]
+      operationId: shortPickTask
+      summary: Report a short pick (adjusts stock and re-allocates the remainder)
+      x-status: pending
+      x-ticket: SP-101
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/TaskIdPath'
+        - $ref: '#/components/parameters/CsrfToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ShortPickRequest' }
+      responses:
+        '200':
+          description: Short recorded.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/ShortPickResult' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+
+  # ---------------------------------------------------------------- Packing & shipping
+  /api/v1/carton-types:
+    get:
+      tags: [Packing & shipping]
+      operationId: listCartonTypes
+      summary: List carton types
+      x-status: pending
+      x-ticket: SP-110
+      x-permission: authenticated
+      responses:
+        '200':
+          description: Carton types.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      { data: { type: array, items: { $ref: '#/components/schemas/CartonType' } } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /api/v1/cartonization:
+    post:
+      tags: [Packing & shipping]
+      operationId: cartonize
+      summary: Choose cartons and item placement for an order (3D heuristic)
+      x-status: pending
+      x-ticket: SP-111
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/CsrfToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CartonizationRequest' }
+      responses:
+        '200':
+          description: Packing plan.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/CartonizationResult' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /api/v1/pack-sessions:
+    post:
+      tags: [Packing & shipping]
+      operationId: startPackSession
+      summary: Start a pack station session for an order
+      x-status: pending
+      x-ticket: SP-112
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/CsrfToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [orderId, station]
+              properties:
+                orderId: { $ref: '#/components/schemas/Uuid' }
+                station: { type: string, minLength: 1, maxLength: 32 }
+      responses:
+        '201':
+          description: Session started.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/PackSession' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /api/v1/shipments:
+    get:
+      tags: [Packing & shipping]
+      operationId: listShipments
+      summary: List shipments
+      x-status: pending
+      x-ticket: SP-120
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/WarehouseIdQuery'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Shipments.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      { data: { type: array, items: { $ref: '#/components/schemas/Shipment' } } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /api/v1/shipments/{shipmentId}/confirm:
+    post:
+      tags: [Packing & shipping]
+      operationId: confirmShipment
+      summary: Confirm a shipment left the dock (decrements on-hand and allocated)
+      x-status: pending
+      x-ticket: SP-123
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/ShipmentIdPath'
+        - $ref: '#/components/parameters/CsrfToken'
+      responses:
+        '200':
+          description: Shipment confirmed.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/Shipment' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /api/v1/manifests/{manifestId}:
+    get:
+      tags: [Packing & shipping]
+      operationId: getManifest
+      summary: Get a carrier manifest
+      x-status: pending
+      x-ticket: SP-120
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/ManifestIdPath'
+      responses:
+        '200':
+          description: Manifest.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/Manifest' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /api/v1/carrier-rates:
+    get:
+      tags: [Packing & shipping]
+      operationId: listCarrierRates
+      summary: Quote from local carrier rate tables
+      x-status: pending
+      x-ticket: SP-121
+      x-permission: authenticated
+      parameters:
+        - { name: weightGrams, in: query, required: true, schema: { type: integer, minimum: 1 } }
+        - {
+            name: destinationZone,
+            in: query,
+            required: true,
+            schema: { type: string, maxLength: 16 },
+          }
+      responses:
+        '200':
+          description: Rates, cheapest first.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      { data: { type: array, items: { $ref: '#/components/schemas/CarrierRate' } } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+
+  # ---------------------------------------------------------------- Counting
+  /api/v1/cycle-counts:
+    get:
+      tags: [Counting]
+      operationId: listCycleCounts
+      summary: List cycle count plans
+      x-status: pending
+      x-ticket: SP-130
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/WarehouseIdQuery'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Counts.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      { data: { type: array, items: { $ref: '#/components/schemas/CycleCount' } } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+    post:
+      tags: [Counting]
+      operationId: createCycleCount
+      summary: Create a cycle count (ABC frequency or explicit bins)
+      x-status: pending
+      x-ticket: SP-130
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/CsrfToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateCycleCountRequest' }
+      responses:
+        '201':
+          description: Count created.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/CycleCount' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /api/v1/cycle-counts/{countId}/results:
+    post:
+      tags: [Counting]
+      operationId: submitCountResults
+      summary: Submit blind count results
+      x-status: pending
+      x-ticket: SP-131
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/CountIdPath'
+        - $ref: '#/components/parameters/CsrfToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CountResultsRequest' }
+      responses:
+        '200':
+          description: Results recorded; variances computed against the ledger at count time.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/CycleCount' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /api/v1/cycle-counts/{countId}/approve:
+    post:
+      tags: [Counting]
+      operationId: approveCountVariances
+      summary: Approve variances and post adjustments
+      x-status: pending
+      x-ticket: SP-132
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/CountIdPath'
+        - $ref: '#/components/parameters/CsrfToken'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                lineIds: { type: array, items: { $ref: '#/components/schemas/Uuid' } }
+                note: { type: string, maxLength: 240 }
+      responses:
+        '200':
+          description: Variances posted as ADJUST_IN / ADJUST_OUT movements.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/CycleCount' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+
+  # ---------------------------------------------------------------- Replenishment
+  /api/v1/replenishment/rules:
+    get:
+      tags: [Replenishment]
+      operationId: listReplenishmentRules
+      summary: List min/max replenishment rules
+      x-status: pending
+      x-ticket: SP-140
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/WarehouseIdQuery'
+      responses:
+        '200':
+          description: Rules.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      {
+                        data:
+                          {
+                            type: array,
+                            items: { $ref: '#/components/schemas/ReplenishmentRule' },
+                          },
+                      }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /api/v1/replenishment/run:
+    post:
+      tags: [Replenishment]
+      operationId: runReplenishment
+      summary: Evaluate rules and create replenishment tasks
+      x-status: pending
+      x-ticket: SP-141
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/CsrfToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [warehouseId]
+              properties:
+                warehouseId: { $ref: '#/components/schemas/Uuid' }
+                dryRun: { type: boolean, default: false }
+      responses:
+        '200':
+          description: Replenishment tasks created by the run.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/ReplenishmentRunResult' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+
+  # ---------------------------------------------------------------- Returns
+  /api/v1/rmas:
+    post:
+      tags: [Returns]
+      operationId: createRma
+      summary: Authorise a customer return
+      x-status: pending
+      x-ticket: SP-150
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/CsrfToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateRmaRequest' }
+      responses:
+        '201':
+          description: RMA authorised.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/Rma' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /api/v1/rmas/{rmaId}/receipts:
+    post:
+      tags: [Returns]
+      operationId: receiveReturn
+      summary: Receive returned items and record their disposition
+      x-status: pending
+      x-ticket: SP-151
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/RmaIdPath'
+        - $ref: '#/components/parameters/CsrfToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RmaReceiptRequest' }
+      responses:
+        '201':
+          description: Return received.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/Rma' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+
+  # ---------------------------------------------------------------- Labels
+  /api/v1/labels/bins/{binId}:
+    get:
+      tags: [Labels]
+      operationId: getBinLabel
+      summary: Printable bin label (SVG with Code128 barcode)
+      x-status: pending
+      x-ticket: SP-161
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/BinIdPath'
+      responses:
+        '200':
+          description: SVG label.
+          content:
+            image/svg+xml:
+              schema: { type: string }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /api/v1/labels/barcode:
+    post:
+      tags: [Labels]
+      operationId: renderBarcode
+      summary: Render a Code128 barcode as SVG (in-house encoder)
+      x-status: pending
+      x-ticket: SP-160
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/CsrfToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BarcodeRequest' }
+      responses:
+        '200':
+          description: SVG barcode.
+          content:
+            image/svg+xml:
+              schema: { type: string }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+
+  # ---------------------------------------------------------------- Reporting
+  /api/v1/dashboards/operations:
+    get:
+      tags: [Reporting]
+      operationId: getOperationsDashboard
+      summary: Throughput and backlog KPIs
+      x-status: pending
+      x-ticket: SP-170
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/WarehouseIdQuery'
+      responses:
+        '200':
+          description: Dashboard tiles.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/OperationsDashboard' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /api/v1/reports/inventory-aging:
+    get:
+      tags: [Reporting]
+      operationId: getInventoryAgingReport
+      summary: Inventory aging and expiry exposure
+      x-status: pending
+      x-ticket: SP-171
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/WarehouseIdQuery'
+      responses:
+        '200':
+          description: Aging buckets per SKU.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      { data: { type: array, items: { $ref: '#/components/schemas/AgingRow' } } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /api/v1/reports/ledger-export:
+    get:
+      tags: [Reporting]
+      operationId: exportLedger
+      summary: Export ledger movements as CSV (streamed)
+      x-status: pending
+      x-ticket: SP-172
+      x-permission: authenticated
+      parameters:
+        - $ref: '#/components/parameters/WarehouseIdQuery'
+        - { name: from, in: query, required: false, schema: { type: string, format: date-time } }
+        - { name: to, in: query, required: false, schema: { type: string, format: date-time } }
+      responses:
+        '200':
+          description: CSV file.
+          content:
+            text/csv:
+              schema: { type: string }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /api/v1/notifications:
+    get:
+      tags: [Reporting]
+      operationId: listNotifications
+      summary: In-app notifications from the local outbox
+      x-status: pending
+      x-ticket: SP-173
+      x-permission: authenticated
+      parameters:
+        - {
+            name: unreadOnly,
+            in: query,
+            required: false,
+            schema: { type: string, enum: ['true', 'false'], default: 'false' },
+          }
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Notifications, newest first.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      {
+                        data: { type: array, items: { $ref: '#/components/schemas/Notification' } },
+                      }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /api/v1/billing/storage:
+    get:
+      tags: [Reporting]
+      operationId: getStorageBilling
+      summary: 3PL storage charges for a client and period
+      x-status: pending
+      x-ticket: SP-174
+      x-permission: authenticated
+      parameters:
+        - {
+            name: clientId,
+            in: query,
+            required: true,
+            schema: { $ref: '#/components/schemas/Uuid' },
+          }
+        - {
+            name: month,
+            in: query,
+            required: true,
+            schema: { type: string, pattern: '^\d{4}-\d{2}$' },
+          }
+      responses:
+        '200':
+          description: Charge lines in integer minor currency units.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/StorageBill' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+  /api/v1/metrics:
+    get:
+      tags: [Reporting]
+      operationId: getMetrics
+      summary: Operational metrics (request rates, latencies, ledger and allocation counters)
+      x-status: pending
+      x-ticket: SP-180
+      x-permission: authenticated
+      responses:
+        '200':
+          description: Metrics snapshot.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties: { data: { $ref: '#/components/schemas/Metrics' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: sp_session
+      description: >-
+        Opaque session token set by `POST /api/v1/auth/login` (HttpOnly, SameSite=Lax,
+        Secure when NODE_ENV=production). The server stores only HMAC-SHA256(token).
+        Mutating requests must also send the CSRF token in `X-CSRF-Token`.
+
+  headers:
+    RetryAfter:
+      description: Seconds until the client may retry.
+      schema: { type: integer, minimum: 1 }
+    RequestId:
+      description: Request id (echoed from a valid incoming `X-Request-Id`, otherwise a UUID).
+      schema: { type: string }
+
+  parameters:
+    CsrfToken:
+      name: X-CSRF-Token
+      in: header
+      required: true
+      description: >-
+        Double-submit CSRF token. Must equal the session's token (the `sp_csrf` cookie,
+        `data.csrfToken` from login or `/auth/me`). Missing or wrong answers
+        `403 CSRF_INVALID`.
+      schema: { type: string }
+    WarehouseIdPath:
+      name: warehouseId
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/Uuid' }
+    BinIdPath:
+      name: binId
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/Uuid' }
+    SkuIdPath:
+      name: skuId
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/Uuid' }
+    AllocationIdPath:
+      name: allocationId
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/Uuid' }
+    UserIdPath:
+      name: userId
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/Uuid' }
+    AsnIdPath:
+      name: asnId
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/Uuid' }
+    TaskIdPath:
+      name: taskId
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/Uuid' }
+    OrderIdPath:
+      name: orderId
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/Uuid' }
+    WaveIdPath:
+      name: waveId
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/Uuid' }
+    ShipmentIdPath:
+      name: shipmentId
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/Uuid' }
+    ManifestIdPath:
+      name: manifestId
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/Uuid' }
+    CountIdPath:
+      name: countId
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/Uuid' }
+    RmaIdPath:
+      name: rmaId
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/Uuid' }
+    WarehouseIdQuery:
+      name: warehouseId
+      in: query
+      required: true
+      schema: { $ref: '#/components/schemas/Uuid' }
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+
+  responses:
+    BadRequest:
+      description: >-
+        `VALIDATION_FAILED` (zod issues in `details` as `[{ path, message }]`, or a
+        referenced record that does not exist), `BAD_REQUEST` (malformed JSON or other
+        framework-level 4xx), or a domain rule code `INVALID_QUANTITY`, `INVALID_UOM`,
+        `NON_INTEGRAL_CONVERSION`, `INVALID_UOM_LADDER`, `INVALID_BIN_CODE`,
+        `INVALID_DATE`, `INVALID_MOVEMENT`.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+          example:
+            data: null
+            error:
+              code: VALIDATION_FAILED
+              message: Request validation failed
+              details:
+                - { path: quantity, message: Expected integer, received float }
+    Unauthenticated:
+      description: '`UNAUTHENTICATED`: no valid, unexpired session cookie.'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+          example:
+            data: null
+            error: { code: UNAUTHENTICATED, message: Authentication required }
+    InvalidCredentials:
+      description: '`INVALID_CREDENTIALS`: generic login failure.'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+          example:
+            data: null
+            error: { code: INVALID_CREDENTIALS, message: Email or password is incorrect }
+    Forbidden:
+      description: '`FORBIDDEN` (role lacks the permission) or `CSRF_INVALID` (mutating request without a matching X-CSRF-Token).'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+          example:
+            data: null
+            error: { code: CSRF_INVALID, message: Missing or invalid CSRF token }
+    NotFound:
+      description: '`NOT_FOUND` with the entity name in the message (Warehouse, Zone, Bin, SKU, Lot, Allocation).'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+          example:
+            data: null
+            error: { code: NOT_FOUND, message: Warehouse not found }
+    Conflict:
+      description: >-
+        State conflict. `ALREADY_EXISTS` (unique key, `details.constraint`),
+        `CONSTRAINT_VIOLATION` (stock CHECK constraint), `INSUFFICIENT_AVAILABLE`,
+        `INSUFFICIENT_ALLOCATED`, `INSUFFICIENT_STOCK`, `LOT_EXPIRY_MISMATCH`,
+        `BIN_INACTIVE`, `ALREADY_RELEASED`.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+          example:
+            data: null
+            error:
+              code: INSUFFICIENT_AVAILABLE
+              message: Not enough available stock in bin
+              details:
+                {
+                  binId: 5b0e1b39-2b7e-4a8e-9b0e-6f1c2d3e4f50,
+                  lotId: 7c1d2e3f-4a5b-4c6d-8e7f-9a0b1c2d3e4f,
+                  requested: 30,
+                  available: 12,
+                }
+    RateLimited:
+      description: '`RATE_LIMITED`: authentication throttle tripped. `details.retryAfterSeconds` equals the Retry-After header.'
+      headers:
+        Retry-After: { $ref: '#/components/headers/RetryAfter' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+          example:
+            data: null
+            error:
+              code: RATE_LIMITED
+              message: Too many failed login attempts, try again later
+              details: { retryAfterSeconds: 60 }
+    UnsupportedMediaType:
+      description: '`UNSUPPORTED_MEDIA_TYPE`: request body is not application/json.'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    ConcurrencyRetry:
+      description: '`CONCURRENCY_RETRY`: PostgreSQL reported a deadlock or serialization failure; the transaction was rolled back and is safe to retry.'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    NotImplemented:
+      description: '`NOT_IMPLEMENTED`: the operation is part of the target API but not built yet; `details.ticket` names the backlog ticket.'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/NotImplementedEnvelope' }
+          example:
+            data: null
+            error:
+              code: NOT_IMPLEMENTED
+              message: Wave planning is planned but not implemented yet
+              details: { ticket: SP-092 }
+
+  schemas:
+    # ------------------------------------------------------------ envelope
+    SuccessEnvelope:
+      type: object
+      required: [data, error]
+      properties:
+        data: {}
+        error: { type: 'null' }
+        meta:
+          type: object
+          additionalProperties: true
+    ErrorBody:
+      type: object
+      required: [code, message]
+      properties:
+        code: { $ref: '#/components/schemas/ErrorCode' }
+        message: { type: string }
+        details: {}
+    ErrorEnvelope:
+      type: object
+      required: [data, error]
+      properties:
+        data: { type: 'null' }
+        error: { $ref: '#/components/schemas/ErrorBody' }
+    NotImplementedEnvelope:
+      type: object
+      required: [data, error]
+      properties:
+        data: { type: 'null' }
+        error:
+          type: object
+          required: [code, message, details]
+          properties:
+            code: { const: NOT_IMPLEMENTED }
+            message: { type: string }
+            details:
+              type: object
+              required: [ticket]
+              properties:
+                ticket: { type: string, pattern: '^SP-\d{3}$' }
+    ValidationIssue:
+      type: object
+      required: [path, message]
+      properties:
+        path: { type: string, description: Dot-joined zod issue path (empty for the root). }
+        message: { type: string }
+    ErrorCode:
+      type: string
+      enum:
+        - VALIDATION_FAILED
+        - BAD_REQUEST
+        - UNSUPPORTED_MEDIA_TYPE
+        - INVALID_QUANTITY
+        - INVALID_UOM
+        - NON_INTEGRAL_CONVERSION
+        - INVALID_UOM_LADDER
+        - INVALID_BIN_CODE
+        - INVALID_DATE
+        - INVALID_MOVEMENT
+        - UNAUTHENTICATED
+        - INVALID_CREDENTIALS
+        - FORBIDDEN
+        - CSRF_INVALID
+        - NOT_FOUND
+        - ROUTE_NOT_FOUND
+        - ALREADY_EXISTS
+        - CONSTRAINT_VIOLATION
+        - INSUFFICIENT_AVAILABLE
+        - INSUFFICIENT_ALLOCATED
+        - INSUFFICIENT_STOCK
+        - LOT_EXPIRY_MISMATCH
+        - BIN_INACTIVE
+        - ALREADY_RELEASED
+        - RATE_LIMITED
+        - NOT_IMPLEMENTED
+        - NOT_READY
+        - CONCURRENCY_RETRY
+        - INTERNAL_ERROR
+    CursorMeta:
+      type: object
+      required: [limit, nextCursor]
+      properties:
+        limit: { type: integer }
+        nextCursor:
+          type: [string, 'null']
+          description: Pass as `before` to fetch the next (older) page; null on the last page.
+    CountMeta:
+      type: object
+      required: [count, limit]
+      properties:
+        count: { type: integer }
+        limit: { type: integer }
+
+    # ------------------------------------------------------------ primitives
+    Uuid: { type: string, format: uuid }
+    IsoDate:
+      type: string
+      pattern: '^\d{4}-\d{2}-\d{2}$'
+      description: Calendar date YYYY-MM-DD (no time zone).
+      examples: ['2026-12-31']
+    Quantity:
+      type: integer
+      minimum: 1
+      maximum: 1000000000000
+      description: Positive whole number. Base units unless paired with a `uom`.
+    BaseQuantity:
+      type: integer
+      minimum: 0
+      description: Whole number of the SKU's base unit.
+    UomCode:
+      type: string
+      pattern: '^[A-Z][A-Z0-9]{0,9}$'
+      description: Unit code (input is trimmed and upper-cased), e.g. EA, CS, PL.
+    Code:
+      type: string
+      minLength: 1
+      maxLength: 32
+      pattern: '^[A-Za-z0-9][A-Za-z0-9_.-]*$'
+      description: Business code; stored upper-cased.
+    Role:
+      type: string
+      enum: [owner, admin, manager, operator, viewer]
+    Permission:
+      type: string
+      enum:
+        - topology:read
+        - topology:write
+        - catalog:read
+        - catalog:write
+        - inventory:read
+        - inventory:receive
+        - inventory:move
+        - inventory:adjust
+        - inventory:verify
+        - allocation:read
+        - allocation:write
+        - audit:read
+        - users:manage
+    AllocationStrategy:
+      type: string
+      enum: [FEFO, FIFO, LIFO]
+    ZoneType:
+      type: string
+      enum: [RECEIVING, STORAGE, PICK, STAGING, SHIPPING, QUARANTINE]
+    MovementType:
+      type: string
+      enum: [RECEIPT, MOVE, ADJUST_IN, ADJUST_OUT, ALLOCATE, DEALLOCATE]
+    AdjustmentReason:
+      type: string
+      enum: [DAMAGED, FOUND, LOST, EXPIRED, CORRECTION]
+
+    # ------------------------------------------------------------ health
+    Health:
+      type: object
+      required: [status, uptimeSeconds]
+      properties:
+        status: { const: ok }
+        uptimeSeconds: { type: integer }
+    Ready:
+      type: object
+      required: [status, database, migrations]
+      properties:
+        status: { const: ready }
+        database: { const: up }
+        migrations: { type: integer, description: Number of applied migrations. }
+
+    # ------------------------------------------------------------ auth
+    RegisterRequest:
+      type: object
+      required: [organizationName, name, email, password]
+      properties:
+        organizationName: { type: string, minLength: 2, maxLength: 120 }
+        name: { type: string, minLength: 1, maxLength: 120 }
+        email:
+          { type: string, format: email, maxLength: 254, description: Trimmed and lower-cased. }
+        password: { type: string, minLength: 12, maxLength: 200 }
+    RegisterAccepted:
+      type: object
+      required: [status, message]
+      properties:
+        status: { const: accepted }
+        message:
+          type: string
+          examples:
+            ['If this email can be registered, the workspace is ready. Sign in to continue.']
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email, maxLength: 254 }
+        password: { type: string, minLength: 1, maxLength: 200 }
+    LoginResult:
+      type: object
+      required: [user, csrfToken]
+      properties:
+        user:
+          type: object
+          required: [id, email, name, role, organizationId]
+          properties:
+            id: { $ref: '#/components/schemas/Uuid' }
+            email: { type: string }
+            name: { type: string }
+            role: { $ref: '#/components/schemas/Role' }
+            organizationId: { $ref: '#/components/schemas/Uuid' }
+        csrfToken: { type: string }
+    MeResult:
+      type: object
+      required: [user, organization, csrfToken]
+      properties:
+        user:
+          type: object
+          required: [id, email, name, role]
+          properties:
+            id: { $ref: '#/components/schemas/Uuid' }
+            email: { type: string }
+            name: { type: string }
+            role: { $ref: '#/components/schemas/Role' }
+        organization:
+          type: object
+          required: [id, name]
+          properties:
+            id: { $ref: '#/components/schemas/Uuid' }
+            name: { type: string }
+        csrfToken: { type: string }
+
+    # ------------------------------------------------------------ topology
+    Warehouse:
+      type: object
+      required: [id, code, name, timezone, isActive, createdAt]
+      properties:
+        id: { $ref: '#/components/schemas/Uuid' }
+        code: { type: string, examples: [LDN1] }
+        name: { type: string }
+        timezone: { type: string, description: Canonical IANA zone, examples: [Europe/London] }
+        isActive: { type: boolean }
+        createdAt: { type: string, format: date-time }
+    CreateWarehouseRequest:
+      type: object
+      required: [code, name]
+      properties:
+        code: { $ref: '#/components/schemas/Code' }
+        name: { type: string, minLength: 1, maxLength: 120 }
+        timezone: { type: string, minLength: 1, maxLength: 64, default: UTC }
+    Zone:
+      type: object
+      required: [id, warehouseId, code, name, zoneType]
+      properties:
+        id: { $ref: '#/components/schemas/Uuid' }
+        warehouseId: { $ref: '#/components/schemas/Uuid' }
+        code: { type: string }
+        name: { type: string }
+        zoneType: { $ref: '#/components/schemas/ZoneType' }
+    CreateZoneRequest:
+      type: object
+      required: [code, name, zoneType]
+      properties:
+        code: { $ref: '#/components/schemas/Code' }
+        name: { type: string, minLength: 1, maxLength: 120 }
+        zoneType: { $ref: '#/components/schemas/ZoneType' }
+    Bin:
+      type: object
+      required:
+        [
+          id,
+          warehouseId,
+          zoneId,
+          zoneCode,
+          code,
+          pickSequence,
+          maxWeightGrams,
+          maxVolumeCm3,
+          isActive,
+        ]
+      properties:
+        id: { $ref: '#/components/schemas/Uuid' }
+        warehouseId: { $ref: '#/components/schemas/Uuid' }
+        zoneId: { $ref: '#/components/schemas/Uuid' }
+        zoneCode: { type: string }
+        code: { type: string, examples: [A-03-12-2-B] }
+        pickSequence: { type: integer, minimum: 0 }
+        maxWeightGrams: { type: [integer, 'null'] }
+        maxVolumeCm3: { type: [integer, 'null'] }
+        isActive: { type: boolean }
+    CreateBinRequest:
+      type: object
+      required: [zoneId, code]
+      properties:
+        zoneId: { $ref: '#/components/schemas/Uuid' }
+        code: { type: string, minLength: 2, maxLength: 32 }
+        pickSequence: { type: integer, minimum: 0, maximum: 2000000000 }
+        maxWeightGrams: { type: integer, minimum: 1, maximum: 100000000 }
+        maxVolumeCm3: { type: integer, minimum: 1, maximum: 1000000000 }
+    WarehousePatch:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        name: { type: string, minLength: 1, maxLength: 120 }
+        timezone: { type: string, maxLength: 64 }
+        isActive: { type: boolean }
+    BinPatch:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        pickSequence: { type: integer, minimum: 0 }
+        maxWeightGrams: { type: [integer, 'null'], minimum: 1 }
+        maxVolumeCm3: { type: [integer, 'null'], minimum: 1 }
+        isActive: { type: boolean, description: Deactivation is refused while the bin holds stock. }
+    ImportReport:
+      type: object
+      required: [rowsRead, created, skipped, errors]
+      properties:
+        rowsRead: { type: integer }
+        created: { type: integer }
+        skipped: { type: integer }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              row: { type: integer }
+              message: { type: string }
+    WarehouseMap:
+      type: object
+      required: [warehouseId, zones]
+      properties:
+        warehouseId: { $ref: '#/components/schemas/Uuid' }
+        zones:
+          type: array
+          items:
+            type: object
+            properties:
+              zoneId: { $ref: '#/components/schemas/Uuid' }
+              code: { type: string }
+              bins:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    binId: { $ref: '#/components/schemas/Uuid' }
+                    code: { type: string }
+                    x: { type: number }
+                    y: { type: number }
+                    utilisation: { type: number, minimum: 0, maximum: 1 }
+
+    # ------------------------------------------------------------ catalogue
+    UomLevel:
+      type: object
+      required: [code, factor]
+      properties:
+        code: { $ref: '#/components/schemas/UomCode' }
+        factor:
+          { type: integer, minimum: 2, description: Base units contained in one of this unit. }
+    Sku:
+      type: object
+      required:
+        [
+          id,
+          code,
+          description,
+          baseUom,
+          uomLevels,
+          lotTracked,
+          expiryTracked,
+          defaultStrategy,
+          isActive,
+        ]
+      properties:
+        id: { $ref: '#/components/schemas/Uuid' }
+        code: { type: string, examples: [MILK-UHT-1L] }
+        description: { type: string }
+        baseUom: { $ref: '#/components/schemas/UomCode' }
+        uomLevels:
+          type: array
+          description: Sorted ascending by factor; each factor is a multiple of the previous.
+          items: { $ref: '#/components/schemas/UomLevel' }
+        lotTracked: { type: boolean }
+        expiryTracked: { type: boolean }
+        defaultStrategy: { $ref: '#/components/schemas/AllocationStrategy' }
+        isActive: { type: boolean }
+    CreateSkuRequest:
+      type: object
+      required: [code, description]
+      properties:
+        code: { $ref: '#/components/schemas/Code' }
+        description: { type: string, minLength: 1, maxLength: 240 }
+        baseUom: { allOf: [{ $ref: '#/components/schemas/UomCode' }], default: EA }
+        uomLevels:
+          type: array
+          maxItems: 6
+          default: []
+          items: { $ref: '#/components/schemas/UomLevel' }
+        lotTracked: { type: boolean, default: false }
+        expiryTracked: { type: boolean, default: false, description: Requires lotTracked. }
+        defaultStrategy:
+          { allOf: [{ $ref: '#/components/schemas/AllocationStrategy' }], default: FIFO }
+    SkuPatch:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        description: { type: string, minLength: 1, maxLength: 240 }
+        uomLevels: { type: array, maxItems: 6, items: { $ref: '#/components/schemas/UomLevel' } }
+        defaultStrategy: { $ref: '#/components/schemas/AllocationStrategy' }
+        isActive: { type: boolean }
+    Lot:
+      type: object
+      required: [id, skuId, lotCode, expiryDate, receivedAt, onHold]
+      properties:
+        id: { $ref: '#/components/schemas/Uuid' }
+        skuId: { $ref: '#/components/schemas/Uuid' }
+        lotCode: { type: string, description: Upper-cased; AUTO-YYYYMMDD for untracked SKUs. }
+        expiryDate: { oneOf: [{ $ref: '#/components/schemas/IsoDate' }, { type: 'null' }] }
+        receivedAt:
+          { type: string, format: date-time, description: First receipt; drives FIFO / LIFO. }
+        onHold: { type: boolean }
+    Serial:
+      type: object
+      required: [serial, skuId, status]
+      properties:
+        serial: { type: string, maxLength: 64 }
+        skuId: { $ref: '#/components/schemas/Uuid' }
+        lotId: { $ref: '#/components/schemas/Uuid' }
+        binId: { type: [string, 'null'], format: uuid }
+        status: { type: string, enum: [IN_STOCK, ALLOCATED, SHIPPED, RETURNED] }
+
+    # ------------------------------------------------------------ inventory
+    ReceiptRequest:
+      type: object
+      required: [warehouseId, binId, skuId, quantity]
+      properties:
+        warehouseId: { $ref: '#/components/schemas/Uuid' }
+        binId: { $ref: '#/components/schemas/Uuid' }
+        skuId: { $ref: '#/components/schemas/Uuid' }
+        quantity: { $ref: '#/components/schemas/Quantity' }
+        uom: { $ref: '#/components/schemas/UomCode' }
+        lotCode: { type: string, minLength: 1, maxLength: 40 }
+        expiryDate: { $ref: '#/components/schemas/IsoDate' }
+        reference: { type: string, maxLength: 64 }
+    LedgerBalance:
+      type: object
+      description: Projection row keyed by (bin, sku, lot). available = onHand - allocated.
+      required: [binId, skuId, lotId, onHand, allocated]
+      properties:
+        binId: { $ref: '#/components/schemas/Uuid' }
+        skuId: { $ref: '#/components/schemas/Uuid' }
+        lotId: { $ref: '#/components/schemas/Uuid' }
+        onHand: { $ref: '#/components/schemas/BaseQuantity' }
+        allocated: { $ref: '#/components/schemas/BaseQuantity' }
+    ReceiptResult:
+      type: object
+      required: [movementId, correlationId, lot, quantity, quantityDescription, balance]
+      properties:
+        movementId: { type: integer }
+        correlationId: { $ref: '#/components/schemas/Uuid' }
+        lot: { $ref: '#/components/schemas/Lot' }
+        quantity: { $ref: '#/components/schemas/BaseQuantity' }
+        quantityDescription: { type: string, examples: ['1 PL + 3 CS + 4 EA'] }
+        balance: { $ref: '#/components/schemas/LedgerBalance' }
+    MoveRequest:
+      type: object
+      required: [warehouseId, fromBinId, toBinId, skuId, lotId, quantity]
+      properties:
+        warehouseId: { $ref: '#/components/schemas/Uuid' }
+        fromBinId: { $ref: '#/components/schemas/Uuid' }
+        toBinId: { $ref: '#/components/schemas/Uuid' }
+        skuId: { $ref: '#/components/schemas/Uuid' }
+        lotId: { $ref: '#/components/schemas/Uuid' }
+        quantity: { $ref: '#/components/schemas/Quantity' }
+        uom: { $ref: '#/components/schemas/UomCode' }
+        reference: { type: string, maxLength: 64 }
+    MoveResult:
+      type: object
+      required: [movementId, correlationId, quantity, balances]
+      properties:
+        movementId: { type: integer }
+        correlationId: { $ref: '#/components/schemas/Uuid' }
+        quantity: { $ref: '#/components/schemas/BaseQuantity' }
+        balances:
+          {
+            type: array,
+            minItems: 2,
+            maxItems: 2,
+            items: { $ref: '#/components/schemas/LedgerBalance' },
+          }
+    AdjustmentRequest:
+      type: object
+      required: [warehouseId, binId, skuId, lotId, delta, reason]
+      properties:
+        warehouseId: { $ref: '#/components/schemas/Uuid' }
+        binId: { $ref: '#/components/schemas/Uuid' }
+        skuId: { $ref: '#/components/schemas/Uuid' }
+        lotId: { $ref: '#/components/schemas/Uuid' }
+        delta:
+          { type: integer, not: { const: 0 }, description: Signed base units; must not be zero. }
+        reason: { $ref: '#/components/schemas/AdjustmentReason' }
+        note: { type: string, maxLength: 240, description: Stored as the movement reference. }
+    AdjustmentResult:
+      type: object
+      required: [movementId, correlationId, balance]
+      properties:
+        movementId: { type: integer }
+        correlationId: { $ref: '#/components/schemas/Uuid' }
+        balance: { $ref: '#/components/schemas/LedgerBalance' }
+    BalanceRow:
+      type: object
+      required:
+        [
+          binId,
+          binCode,
+          zoneCode,
+          skuId,
+          skuCode,
+          skuDescription,
+          baseUom,
+          lotId,
+          lotCode,
+          expiryDate,
+          onHand,
+          allocated,
+          available,
+          updatedAt,
+        ]
+      properties:
+        binId: { $ref: '#/components/schemas/Uuid' }
+        binCode: { type: string }
+        zoneCode: { type: string }
+        skuId: { $ref: '#/components/schemas/Uuid' }
+        skuCode: { type: string }
+        skuDescription: { type: string }
+        baseUom: { type: string }
+        lotId: { $ref: '#/components/schemas/Uuid' }
+        lotCode: { type: string }
+        expiryDate: { oneOf: [{ $ref: '#/components/schemas/IsoDate' }, { type: 'null' }] }
+        onHand: { $ref: '#/components/schemas/BaseQuantity' }
+        allocated: { $ref: '#/components/schemas/BaseQuantity' }
+        available: { $ref: '#/components/schemas/BaseQuantity' }
+        updatedAt: { type: string, format: date-time }
+    Movement:
+      type: object
+      required:
+        [
+          id,
+          movementType,
+          skuId,
+          skuCode,
+          lotId,
+          lotCode,
+          fromBinId,
+          fromBinCode,
+          toBinId,
+          toBinCode,
+          quantity,
+          reason,
+          reference,
+          correlationId,
+          actorUserId,
+          occurredAt,
+        ]
+      properties:
+        id: { type: integer, description: Global ledger sequence; also the pagination cursor. }
+        movementType: { $ref: '#/components/schemas/MovementType' }
+        skuId: { $ref: '#/components/schemas/Uuid' }
+        skuCode: { type: string }
+        lotId: { $ref: '#/components/schemas/Uuid' }
+        lotCode: { type: string }
+        fromBinId: { type: [string, 'null'], format: uuid }
+        fromBinCode: { type: [string, 'null'] }
+        toBinId: { type: [string, 'null'], format: uuid }
+        toBinCode: { type: [string, 'null'] }
+        quantity: { $ref: '#/components/schemas/Quantity' }
+        reason: { type: [string, 'null'] }
+        reference: { type: [string, 'null'] }
+        correlationId: { $ref: '#/components/schemas/Uuid' }
+        actorUserId: { type: [string, 'null'], format: uuid }
+        occurredAt: { type: string, format: date-time }
+    BalanceMismatch:
+      type: object
+      required: [key, expected, actual]
+      properties:
+        key:
+          type: object
+          required: [binId, skuId, lotId]
+          properties:
+            binId: { $ref: '#/components/schemas/Uuid' }
+            skuId: { $ref: '#/components/schemas/Uuid' }
+            lotId: { $ref: '#/components/schemas/Uuid' }
+        expected:
+          type: object
+          description: Value derived from the ledger.
+          properties:
+            onHand: { type: integer }
+            allocated: { type: integer }
+        actual:
+          type: object
+          description: Value stored in stock_balances.
+          properties:
+            onHand: { type: integer }
+            allocated: { type: integer }
+    ProjectionReport:
+      type: object
+      required: [consistent, movementCount, balanceCount, mismatches]
+      properties:
+        consistent: { type: boolean }
+        movementCount: { type: integer }
+        balanceCount: { type: integer }
+        mismatches: { type: array, items: { $ref: '#/components/schemas/BalanceMismatch' } }
+    HoldRequest:
+      type: object
+      required: [warehouseId, skuId, lotId, status, reason]
+      properties:
+        warehouseId: { $ref: '#/components/schemas/Uuid' }
+        skuId: { $ref: '#/components/schemas/Uuid' }
+        lotId: { $ref: '#/components/schemas/Uuid' }
+        binId: { $ref: '#/components/schemas/Uuid' }
+        quantity: { $ref: '#/components/schemas/Quantity' }
+        status: { type: string, enum: [QUARANTINE, DAMAGED, QA] }
+        reason: { type: string, maxLength: 240 }
+    Hold:
+      allOf:
+        - $ref: '#/components/schemas/HoldRequest'
+        - type: object
+          required: [id, createdAt]
+          properties:
+            id: { $ref: '#/components/schemas/Uuid' }
+            createdAt: { type: string, format: date-time }
+            releasedAt: { type: [string, 'null'], format: date-time }
+    LedgerSnapshot:
+      type: object
+      required: [id, upToMovementId, balanceCount, createdAt]
+      properties:
+        id: { $ref: '#/components/schemas/Uuid' }
+        warehouseId: { type: [string, 'null'], format: uuid }
+        upToMovementId: { type: integer }
+        balanceCount: { type: integer }
+        createdAt: { type: string, format: date-time }
+
+    # ------------------------------------------------------------ allocation
+    AllocationRequest:
+      type: object
+      required: [warehouseId, orderRef, lines]
+      properties:
+        warehouseId: { $ref: '#/components/schemas/Uuid' }
+        orderRef: { type: string, minLength: 1, maxLength: 64 }
+        strategy:
+          allOf: [{ $ref: '#/components/schemas/AllocationStrategy' }]
+          description: Overrides every SKU's defaultStrategy for this order.
+        shipComplete:
+          { type: boolean, default: false, description: All-or-nothing across every line. }
+        minShelfLifeDays: { type: integer, minimum: 0, maximum: 3650 }
+        lines:
+          type: array
+          minItems: 1
+          maxItems: 200
+          items:
+            type: object
+            required: [skuId, quantity]
+            properties:
+              skuId: { $ref: '#/components/schemas/Uuid' }
+              quantity: { $ref: '#/components/schemas/Quantity' }
+              uom: { $ref: '#/components/schemas/UomCode' }
+    AllocationHeader:
+      type: object
+      required:
+        [id, warehouseId, orderRef, status, shipComplete, minShelfLifeDays, createdAt, releasedAt]
+      properties:
+        id: { $ref: '#/components/schemas/Uuid' }
+        warehouseId: { $ref: '#/components/schemas/Uuid' }
+        orderRef: { type: string }
+        status: { type: string, enum: [ALLOCATED, PARTIAL, RELEASED] }
+        shipComplete: { type: boolean }
+        minShelfLifeDays: { type: [integer, 'null'] }
+        createdAt: { type: string, format: date-time }
+        releasedAt: { type: [string, 'null'], format: date-time }
+    AllocationPick:
+      type: object
+      required: [binId, binCode, lotId, lotCode, expiryDate, quantity]
+      properties:
+        binId: { $ref: '#/components/schemas/Uuid' }
+        binCode: { type: string }
+        lotId: { $ref: '#/components/schemas/Uuid' }
+        lotCode: { type: string }
+        expiryDate: { oneOf: [{ $ref: '#/components/schemas/IsoDate' }, { type: 'null' }] }
+        quantity: { $ref: '#/components/schemas/Quantity' }
+    AllocationLine:
+      type: object
+      required: [lineNo, skuId, skuCode, strategy, requested, allocated, picks]
+      properties:
+        lineNo: { type: integer, minimum: 1 }
+        skuId: { $ref: '#/components/schemas/Uuid' }
+        skuCode: { type: string }
+        strategy: { $ref: '#/components/schemas/AllocationStrategy' }
+        requested: { $ref: '#/components/schemas/Quantity' }
+        allocated: { $ref: '#/components/schemas/BaseQuantity' }
+        picks: { type: array, items: { $ref: '#/components/schemas/AllocationPick' } }
+    Allocation:
+      allOf:
+        - $ref: '#/components/schemas/AllocationHeader'
+        - type: object
+          required: [lines]
+          properties:
+            lines: { type: array, items: { $ref: '#/components/schemas/AllocationLine' } }
+
+    # ------------------------------------------------------------ pending: identity
+    VerifyEmailRequest:
+      type: object
+      required: [token]
+      properties:
+        token: { type: string, minLength: 32, maxLength: 128 }
+    VerifyEmailResult:
+      type: object
+      required: [email, verifiedAt]
+      properties:
+        email: { type: string, format: email }
+        verifiedAt: { type: string, format: date-time }
+    PasswordResetRequest:
+      oneOf:
+        - type: object
+          required: [email]
+          properties:
+            email: { type: string, format: email }
+        - type: object
+          required: [token, newPassword]
+          properties:
+            token: { type: string, minLength: 32, maxLength: 128 }
+            newPassword: { type: string, minLength: 12, maxLength: 200 }
+    User:
+      type: object
+      required: [id, email, name, role, isActive, createdAt]
+      properties:
+        id: { $ref: '#/components/schemas/Uuid' }
+        email: { type: string, format: email }
+        name: { type: string }
+        role: { $ref: '#/components/schemas/Role' }
+        isActive: { type: boolean }
+        createdAt: { type: string, format: date-time }
+        lastLoginAt: { type: [string, 'null'], format: date-time }
+    InvitationRequest:
+      type: object
+      required: [email, role]
+      properties:
+        email: { type: string, format: email }
+        name: { type: string, maxLength: 120 }
+        role: { $ref: '#/components/schemas/Role' }
+    Invitation:
+      type: object
+      required: [id, email, role, expiresAt]
+      properties:
+        id: { $ref: '#/components/schemas/Uuid' }
+        email: { type: string, format: email }
+        role: { $ref: '#/components/schemas/Role' }
+        expiresAt: { type: string, format: date-time }
+    UserPatch:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        role: { $ref: '#/components/schemas/Role' }
+        isActive: { type: boolean }
+    RoleDefinition:
+      type: object
+      required: [name, builtIn, permissions]
+      properties:
+        name: { type: string }
+        builtIn: { type: boolean }
+        permissions: { type: array, items: { $ref: '#/components/schemas/Permission' } }
+    Client:
+      type: object
+      required: [id, code, name, isActive]
+      properties:
+        id: { $ref: '#/components/schemas/Uuid' }
+        code: { type: string }
+        name: { type: string }
+        isActive: { type: boolean }
+    AuditEvent:
+      type: object
+      required: [id, action, entityType, occurredAt]
+      properties:
+        id: { type: integer }
+        actorUserId: { type: [string, 'null'], format: uuid }
+        action: { type: string, examples: [allocation.created] }
+        entityType: { type: string }
+        entityId: { type: [string, 'null'] }
+        requestId: { type: [string, 'null'] }
+        metadata: { type: object, additionalProperties: true }
+        occurredAt: { type: string, format: date-time }
+
+    # ------------------------------------------------------------ pending: inbound / putaway
+    AsnStatus:
+      type: string
+      enum: [EXPECTED, RECEIVING, CLOSED, CANCELLED]
+    AsnLine:
+      type: object
+      required: [lineNo, skuId, expectedQty, receivedQty]
+      properties:
+        lineNo: { type: integer }
+        skuId: { $ref: '#/components/schemas/Uuid' }
+        expectedQty: { $ref: '#/components/schemas/Quantity' }
+        receivedQty: { $ref: '#/components/schemas/BaseQuantity' }
+        damagedQty: { $ref: '#/components/schemas/BaseQuantity' }
+        lotCode: { type: [string, 'null'] }
+        expiryDate: { oneOf: [{ $ref: '#/components/schemas/IsoDate' }, { type: 'null' }] }
+    Asn:
+      type: object
+      required: [id, warehouseId, asnNumber, status, expectedAt, lines]
+      properties:
+        id: { $ref: '#/components/schemas/Uuid' }
+        warehouseId: { $ref: '#/components/schemas/Uuid' }
+        asnNumber: { type: string }
+        supplier: { type: string }
+        status: { $ref: '#/components/schemas/AsnStatus' }
+        expectedAt: { type: string, format: date-time }
+        lines: { type: array, items: { $ref: '#/components/schemas/AsnLine' } }
+    CreateAsnRequest:
+      type: object
+      required: [warehouseId, asnNumber, expectedAt, lines]
+      properties:
+        warehouseId: { $ref: '#/components/schemas/Uuid' }
+        asnNumber: { type: string, maxLength: 64 }
+        supplier: { type: string, maxLength: 120 }
+        expectedAt: { type: string, format: date-time }
+        lines:
+          type: array
+          minItems: 1
+          maxItems: 500
+          items:
+            type: object
+            required: [skuId, quantity]
+            properties:
+              skuId: { $ref: '#/components/schemas/Uuid' }
+              quantity: { $ref: '#/components/schemas/Quantity' }
+              uom: { $ref: '#/components/schemas/UomCode' }
+              lotCode: { type: string, maxLength: 40 }
+              expiryDate: { $ref: '#/components/schemas/IsoDate' }
+    AsnReceiptRequest:
+      type: object
+      required: [lineNo, binId, quantity]
+      properties:
+        lineNo: { type: integer, minimum: 1 }
+        binId: { $ref: '#/components/schemas/Uuid' }
+        quantity: { $ref: '#/components/schemas/Quantity' }
+        uom: { $ref: '#/components/schemas/UomCode' }
+        lotCode: { type: string, maxLength: 40 }
+        expiryDate: { $ref: '#/components/schemas/IsoDate' }
+        damagedQuantity: { type: integer, minimum: 0 }
+    AsnDiscrepancyReport:
+      type: object
+      required: [asnId, status, lines]
+      properties:
+        asnId: { $ref: '#/components/schemas/Uuid' }
+        status: { const: CLOSED }
+        lines:
+          type: array
+          items:
+            type: object
+            properties:
+              lineNo: { type: integer }
+              expected: { type: integer }
+              received: { type: integer }
+              damaged: { type: integer }
+              variance: { type: integer }
+              kind: { type: string, enum: [MATCH, OVER, SHORT, DAMAGED] }
+    InspectionRequest:
+      type: object
+      required: [warehouseId, lotId, result]
+      properties:
+        warehouseId: { $ref: '#/components/schemas/Uuid' }
+        lotId: { $ref: '#/components/schemas/Uuid' }
+        sampleSize: { type: integer, minimum: 1 }
+        result: { type: string, enum: [PASS, FAIL] }
+        notes: { type: string, maxLength: 1000 }
+    Inspection:
+      allOf:
+        - $ref: '#/components/schemas/InspectionRequest'
+        - type: object
+          required: [id, inspectedAt]
+          properties:
+            id: { $ref: '#/components/schemas/Uuid' }
+            inspectedAt: { type: string, format: date-time }
+            holdId: { type: [string, 'null'], format: uuid }
+    PutawaySuggestionRequest:
+      type: object
+      required: [warehouseId, skuId, lotId, quantity, fromBinId]
+      properties:
+        warehouseId: { $ref: '#/components/schemas/Uuid' }
+        fromBinId: { $ref: '#/components/schemas/Uuid' }
+        skuId: { $ref: '#/components/schemas/Uuid' }
+        lotId: { $ref: '#/components/schemas/Uuid' }
+        quantity: { $ref: '#/components/schemas/Quantity' }
+    PutawaySuggestion:
+      type: object
+      required: [binId, binCode, quantity, score, reasons]
+      properties:
+        binId: { $ref: '#/components/schemas/Uuid' }
+        binCode: { type: string }
+        quantity: { $ref: '#/components/schemas/Quantity' }
+        score: { type: number }
+        reasons: { type: array, items: { type: string } }
+    PutawayTask:
+      type: object
+      required: [id, status, skuId, lotId, fromBinId, toBinId, quantity]
+      properties:
+        id: { $ref: '#/components/schemas/Uuid' }
+        status: { type: string, enum: [OPEN, IN_PROGRESS, DONE, CANCELLED] }
+        skuId: { $ref: '#/components/schemas/Uuid' }
+        lotId: { $ref: '#/components/schemas/Uuid' }
+        fromBinId: { $ref: '#/components/schemas/Uuid' }
+        toBinId: { $ref: '#/components/schemas/Uuid' }
+        quantity: { $ref: '#/components/schemas/Quantity' }
+        assignedTo: { type: [string, 'null'], format: uuid }
+    TaskConfirmRequest:
+      type: object
+      required: [scannedBinCode, quantity]
+      properties:
+        scannedBinCode: { type: string, maxLength: 32 }
+        scannedLotCode: { type: string, maxLength: 40 }
+        quantity: { $ref: '#/components/schemas/Quantity' }
+        toBinId: { $ref: '#/components/schemas/Uuid' }
+    SlottingRecommendation:
+      type: object
+      required: [skuId, abcClass, currentBinId, suggestedBinId, estimatedTravelSavingMetres]
+      properties:
+        skuId: { $ref: '#/components/schemas/Uuid' }
+        abcClass: { type: string, enum: [A, B, C] }
+        picksPerDay: { type: number }
+        currentBinId: { $ref: '#/components/schemas/Uuid' }
+        suggestedBinId: { $ref: '#/components/schemas/Uuid' }
+        estimatedTravelSavingMetres: { type: number }
+
+    # ------------------------------------------------------------ pending: outbound / picking
+    OrderStatus:
+      type: string
+      enum:
+        [
+          NEW,
+          ALLOCATED,
+          PARTIALLY_ALLOCATED,
+          BACKORDERED,
+          RELEASED,
+          PICKED,
+          PACKED,
+          SHIPPED,
+          CANCELLED,
+        ]
+    Order:
+      type: object
+      required: [id, warehouseId, orderRef, status, lines, createdAt]
+      properties:
+        id: { $ref: '#/components/schemas/Uuid' }
+        warehouseId: { $ref: '#/components/schemas/Uuid' }
+        orderRef: { type: string }
+        status: { $ref: '#/components/schemas/OrderStatus' }
+        carrier: { type: [string, 'null'] }
+        cutOffAt: { type: [string, 'null'], format: date-time }
+        allocationId: { type: [string, 'null'], format: uuid }
+        lines:
+          type: array
+          items:
+            type: object
+            properties:
+              lineNo: { type: integer }
+              skuId: { $ref: '#/components/schemas/Uuid' }
+              quantity: { $ref: '#/components/schemas/Quantity' }
+        createdAt: { type: string, format: date-time }
+    CreateOrderRequest:
+      type: object
+      required: [warehouseId, orderRef, lines]
+      properties:
+        warehouseId: { $ref: '#/components/schemas/Uuid' }
+        orderRef: { type: string, maxLength: 64 }
+        carrier: { type: string, maxLength: 32 }
+        cutOffAt: { type: string, format: date-time }
+        shipComplete: { type: boolean, default: false }
+        shipTo:
+          type: object
+          properties:
+            name: { type: string, maxLength: 120 }
+            line1: { type: string, maxLength: 120 }
+            city: { type: string, maxLength: 80 }
+            postcode: { type: string, maxLength: 16 }
+            country: { type: string, pattern: '^[A-Z]{2}$' }
+        lines:
+          type: array
+          minItems: 1
+          maxItems: 200
+          items:
+            type: object
+            required: [skuId, quantity]
+            properties:
+              skuId: { $ref: '#/components/schemas/Uuid' }
+              quantity: { $ref: '#/components/schemas/Quantity' }
+              uom: { $ref: '#/components/schemas/UomCode' }
+    Wave:
+      type: object
+      required: [id, warehouseId, status, orderCount, createdAt]
+      properties:
+        id: { $ref: '#/components/schemas/Uuid' }
+        warehouseId: { $ref: '#/components/schemas/Uuid' }
+        status: { type: string, enum: [PLANNED, RELEASED, PICKING, DONE] }
+        carrier: { type: [string, 'null'] }
+        cutOffAt: { type: [string, 'null'], format: date-time }
+        zoneCodes: { type: array, items: { type: string } }
+        orderCount: { type: integer }
+        createdAt: { type: string, format: date-time }
+    CreateWaveRequest:
+      type: object
+      required: [warehouseId]
+      properties:
+        warehouseId: { $ref: '#/components/schemas/Uuid' }
+        carrier: { type: string, maxLength: 32 }
+        cutOffBefore: { type: string, format: date-time }
+        zoneCodes: { type: array, items: { type: string } }
+        maxOrders: { type: integer, minimum: 1, maximum: 1000, default: 200 }
+    WaveReleaseResult:
+      type: object
+      required: [waveId, allocated, backordered, pickTaskCount]
+      properties:
+        waveId: { $ref: '#/components/schemas/Uuid' }
+        allocated: { type: integer }
+        backordered: { type: integer }
+        pickTaskCount: { type: integer }
+    PickPathRequest:
+      type: object
+      required: [warehouseId, binIds]
+      properties:
+        warehouseId: { $ref: '#/components/schemas/Uuid' }
+        startBinId: { $ref: '#/components/schemas/Uuid' }
+        binIds:
+          { type: array, minItems: 1, maxItems: 500, items: { $ref: '#/components/schemas/Uuid' } }
+        method: { type: string, enum: [S_SHAPE, LARGEST_GAP, TWO_OPT], default: TWO_OPT }
+    PickPathResult:
+      type: object
+      required: [orderedBinIds, distanceMetres, method]
+      properties:
+        orderedBinIds: { type: array, items: { $ref: '#/components/schemas/Uuid' } }
+        distanceMetres: { type: number }
+        baselineDistanceMetres:
+          { type: number, description: Distance of the pick-sequence order, for comparison. }
+        method: { type: string }
+    PickTask:
+      type: object
+      required: [id, status, sequence, binId, binCode, skuId, lotId, quantity]
+      properties:
+        id: { $ref: '#/components/schemas/Uuid' }
+        waveId: { type: [string, 'null'], format: uuid }
+        allocationId: { $ref: '#/components/schemas/Uuid' }
+        status: { type: string, enum: [OPEN, PICKED, SHORT, CANCELLED] }
+        sequence: { type: integer }
+        binId: { $ref: '#/components/schemas/Uuid' }
+        binCode: { type: string }
+        skuId: { $ref: '#/components/schemas/Uuid' }
+        lotId: { $ref: '#/components/schemas/Uuid' }
+        quantity: { $ref: '#/components/schemas/Quantity' }
+        pickedQuantity: { $ref: '#/components/schemas/BaseQuantity' }
+    ShortPickRequest:
+      type: object
+      required: [scannedBinCode, foundQuantity]
+      properties:
+        scannedBinCode: { type: string, maxLength: 32 }
+        foundQuantity: { type: integer, minimum: 0 }
+        note: { type: string, maxLength: 240 }
+    ShortPickResult:
+      type: object
+      required: [task, adjustmentMovementId, reallocated]
+      properties:
+        task: { $ref: '#/components/schemas/PickTask' }
+        adjustmentMovementId: { type: integer }
+        reallocated: { $ref: '#/components/schemas/BaseQuantity' }
+        replacementTaskIds: { type: array, items: { $ref: '#/components/schemas/Uuid' } }
+
+    # ------------------------------------------------------------ pending: packing / shipping
+    CartonType:
+      type: object
+      required: [id, code, innerLengthMm, innerWidthMm, innerHeightMm, maxWeightGrams]
+      properties:
+        id: { $ref: '#/components/schemas/Uuid' }
+        code: { type: string }
+        innerLengthMm: { type: integer, minimum: 1 }
+        innerWidthMm: { type: integer, minimum: 1 }
+        innerHeightMm: { type: integer, minimum: 1 }
+        tareGrams: { type: integer, minimum: 0 }
+        maxWeightGrams: { type: integer, minimum: 1 }
+    CartonizationRequest:
+      type: object
+      required: [items]
+      properties:
+        orderId: { $ref: '#/components/schemas/Uuid' }
+        cartonTypeIds: { type: array, items: { $ref: '#/components/schemas/Uuid' } }
+        items:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [skuId, quantity]
+            properties:
+              skuId: { $ref: '#/components/schemas/Uuid' }
+              quantity: { $ref: '#/components/schemas/Quantity' }
+    CartonizationResult:
+      type: object
+      required: [cartons, fillRatio]
+      properties:
+        fillRatio: { type: number, minimum: 0, maximum: 1 }
+        unpacked:
+          {
+            type: array,
+            items:
+              {
+                type: object,
+                properties: { skuId: { type: string }, quantity: { type: integer } },
+              },
+          }
+        cartons:
+          type: array
+          items:
+            type: object
+            properties:
+              cartonTypeId: { $ref: '#/components/schemas/Uuid' }
+              weightGrams: { type: integer }
+              placements:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    skuId: { $ref: '#/components/schemas/Uuid' }
+                    x: { type: integer }
+                    y: { type: integer }
+                    z: { type: integer }
+                    rotation: { type: string, enum: [LWH, LHW, WLH, WHL, HLW, HWL] }
+    PackSession:
+      type: object
+      required: [id, orderId, station, status, startedAt]
+      properties:
+        id: { $ref: '#/components/schemas/Uuid' }
+        orderId: { $ref: '#/components/schemas/Uuid' }
+        station: { type: string }
+        status: { type: string, enum: [OPEN, CLOSED] }
+        startedAt: { type: string, format: date-time }
+    Shipment:
+      type: object
+      required: [id, orderId, status, carrier, cartonCount]
+      properties:
+        id: { $ref: '#/components/schemas/Uuid' }
+        orderId: { $ref: '#/components/schemas/Uuid' }
+        status: { type: string, enum: [PACKED, MANIFESTED, SHIPPED] }
+        carrier: { type: string }
+        trackingNumber: { type: [string, 'null'] }
+        cartonCount: { type: integer }
+        manifestId: { type: [string, 'null'], format: uuid }
+        shippedAt: { type: [string, 'null'], format: date-time }
+    Manifest:
+      type: object
+      required: [id, carrier, shipmentIds, createdAt]
+      properties:
+        id: { $ref: '#/components/schemas/Uuid' }
+        carrier: { type: string }
+        shipmentIds: { type: array, items: { $ref: '#/components/schemas/Uuid' } }
+        totalWeightGrams: { type: integer }
+        createdAt: { type: string, format: date-time }
+    CarrierRate:
+      type: object
+      required: [carrier, service, priceMinor, currency]
+      properties:
+        carrier: { type: string }
+        service: { type: string }
+        priceMinor: { type: integer, description: Price in integer minor currency units. }
+        currency: { type: string, pattern: '^[A-Z]{3}$' }
+        transitDays: { type: integer }
+
+    # ------------------------------------------------------------ pending: counting / replenishment / returns
+    CycleCount:
+      type: object
+      required: [id, warehouseId, status, lines]
+      properties:
+        id: { $ref: '#/components/schemas/Uuid' }
+        warehouseId: { $ref: '#/components/schemas/Uuid' }
+        status: { type: string, enum: [PLANNED, COUNTING, REVIEW, POSTED] }
+        scheduledFor: { $ref: '#/components/schemas/IsoDate' }
+        lines:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { $ref: '#/components/schemas/Uuid' }
+              binId: { $ref: '#/components/schemas/Uuid' }
+              skuId: { $ref: '#/components/schemas/Uuid' }
+              lotId: { $ref: '#/components/schemas/Uuid' }
+              countedQty: { type: [integer, 'null'] }
+              systemQty:
+                {
+                  type: [integer, 'null'],
+                  description: Hidden from counters until submitted (blind count).,
+                }
+              variance: { type: [integer, 'null'] }
+    CreateCycleCountRequest:
+      type: object
+      required: [warehouseId]
+      properties:
+        warehouseId: { $ref: '#/components/schemas/Uuid' }
+        scheduledFor: { $ref: '#/components/schemas/IsoDate' }
+        abcClasses: { type: array, items: { type: string, enum: [A, B, C] } }
+        binIds: { type: array, items: { $ref: '#/components/schemas/Uuid' } }
+    CountResultsRequest:
+      type: object
+      required: [results]
+      properties:
+        results:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [lineId, countedQty]
+            properties:
+              lineId: { $ref: '#/components/schemas/Uuid' }
+              countedQty: { type: integer, minimum: 0 }
+    ReplenishmentRule:
+      type: object
+      required: [id, skuId, pickBinId, minQty, maxQty]
+      properties:
+        id: { $ref: '#/components/schemas/Uuid' }
+        skuId: { $ref: '#/components/schemas/Uuid' }
+        pickBinId: { $ref: '#/components/schemas/Uuid' }
+        minQty: { $ref: '#/components/schemas/BaseQuantity' }
+        maxQty: { $ref: '#/components/schemas/Quantity' }
+        replenishUom: { $ref: '#/components/schemas/UomCode' }
+    ReplenishmentRunResult:
+      type: object
+      required: [evaluatedRules, tasks]
+      properties:
+        evaluatedRules: { type: integer }
+        tasks:
+          type: array
+          items:
+            type: object
+            properties:
+              skuId: { $ref: '#/components/schemas/Uuid' }
+              fromBinId: { $ref: '#/components/schemas/Uuid' }
+              toBinId: { $ref: '#/components/schemas/Uuid' }
+              quantity: { $ref: '#/components/schemas/Quantity' }
+    Rma:
+      type: object
+      required: [id, rmaNumber, status, lines]
+      properties:
+        id: { $ref: '#/components/schemas/Uuid' }
+        rmaNumber: { type: string }
+        orderRef: { type: string }
+        status: { type: string, enum: [AUTHORISED, RECEIVED, CLOSED] }
+        lines:
+          type: array
+          items:
+            type: object
+            properties:
+              skuId: { $ref: '#/components/schemas/Uuid' }
+              quantity: { $ref: '#/components/schemas/Quantity' }
+              receivedQty: { $ref: '#/components/schemas/BaseQuantity' }
+    CreateRmaRequest:
+      type: object
+      required: [warehouseId, orderRef, lines]
+      properties:
+        warehouseId: { $ref: '#/components/schemas/Uuid' }
+        orderRef: { type: string, maxLength: 64 }
+        reason: { type: string, maxLength: 240 }
+        lines:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [skuId, quantity]
+            properties:
+              skuId: { $ref: '#/components/schemas/Uuid' }
+              quantity: { $ref: '#/components/schemas/Quantity' }
+    RmaReceiptRequest:
+      type: object
+      required: [skuId, quantity, disposition, binId]
+      properties:
+        skuId: { $ref: '#/components/schemas/Uuid' }
+        lotCode: { type: string, maxLength: 40 }
+        quantity: { $ref: '#/components/schemas/Quantity' }
+        binId: { $ref: '#/components/schemas/Uuid' }
+        disposition: { type: string, enum: [RESTOCK, QUARANTINE, SCRAP, RETURN_TO_VENDOR] }
+
+    # ------------------------------------------------------------ pending: labels / reporting
+    BarcodeRequest:
+      type: object
+      required: [value]
+      properties:
+        value:
+          {
+            type: string,
+            minLength: 1,
+            maxLength: 80,
+            description: Printable ASCII (Code128 B / C).,
+          }
+        moduleWidth: { type: integer, minimum: 1, maximum: 10, default: 2 }
+        height: { type: integer, minimum: 10, maximum: 400, default: 80 }
+        humanReadable: { type: boolean, default: true }
+    OperationsDashboard:
+      type: object
+      required: [computedAt, tiles]
+      properties:
+        computedAt: { type: string, format: date-time }
+        tiles:
+          type: object
+          properties:
+            ordersOpen: { type: integer }
+            linesPickedToday: { type: integer }
+            unitsReceivedToday: { type: integer }
+            pickTasksOpen: { type: integer }
+            ordersAtRiskOfCutOff: { type: integer }
+    AgingRow:
+      type: object
+      required: [skuId, skuCode, buckets]
+      properties:
+        skuId: { $ref: '#/components/schemas/Uuid' }
+        skuCode: { type: string }
+        expiringWithin30Days: { $ref: '#/components/schemas/BaseQuantity' }
+        buckets:
+          type: object
+          properties:
+            d0_30: { type: integer }
+            d31_90: { type: integer }
+            d91_180: { type: integer }
+            d181Plus: { type: integer }
+    Notification:
+      type: object
+      required: [id, kind, title, createdAt, readAt]
+      properties:
+        id: { $ref: '#/components/schemas/Uuid' }
+        kind: { type: string, examples: [allocation.backordered] }
+        title: { type: string }
+        body: { type: string }
+        createdAt: { type: string, format: date-time }
+        readAt: { type: [string, 'null'], format: date-time }
+    StorageBill:
+      type: object
+      required: [clientId, month, currency, lines, totalMinor]
+      properties:
+        clientId: { $ref: '#/components/schemas/Uuid' }
+        month: { type: string }
+        currency: { type: string, pattern: '^[A-Z]{3}$' }
+        totalMinor: { type: integer }
+        lines:
+          type: array
+          items:
+            type: object
+            properties:
+              description: { type: string }
+              quantity: { type: number }
+              unitPriceMinor: { type: integer }
+              amountMinor: { type: integer }
+    Metrics:
+      type: object
+      required: [collectedAt, http, ledger, allocation]
+      properties:
+        collectedAt: { type: string, format: date-time }
+        http:
+          type: object
+          properties:
+            requestsTotal: { type: integer }
+            p95LatencyMs: { type: number }
+            errors5xx: { type: integer }
+        ledger:
+          type: object
+          properties:
+            movementsTotal: { type: integer }
+            lastMovementId: { type: integer }
+        allocation:
+          type: object
+          properties:
+            allocationsTotal: { type: integer }
+            insufficientStockTotal: { type: integer }
+            concurrencyRetriesTotal: { type: integer }

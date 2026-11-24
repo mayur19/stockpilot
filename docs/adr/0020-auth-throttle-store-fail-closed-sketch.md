@@ -9,13 +9,13 @@
 Login and registration throttles (ADR-0006) keep per-email, per-IP and per-prefix
 counters in process memory. Memory must be bounded, otherwise a client sending
 requests for millions of distinct emails exhausts the heap. Every bounded store has
-to answer one question when it is full of *active* entries:
+to answer one question when it is full of _active_ entries:
 
 - **Fail open** — evict something (oldest, least time left). Cheap and keeps the
   service available, but an attacker can flood the store with fresh keys until the
   victim's lock-out is evicted, then resume guessing at full speed.
 - **Fail closed** — refuse or maximally delay new keys. Lock-outs can never be
-  cleared, but the same flood now locks *everyone* out: a denial of service.
+  cleared, but the same flood now locks _everyone_ out: a denial of service.
 
 Neither extreme is acceptable for a login endpoint.
 
@@ -34,7 +34,7 @@ Neither extreme is acceptable for a login endpoint.
 4. Sketch as the source of truth, written on every failure (rejected: failures spread
    across many emails fill the sketch and eventually lock out untouched emails; a
    reset on successful login cannot be expressed in a count-min sketch).
-5. **Bounded authoritative `Map`; force-evicted *active* entries spill into a
+5. **Bounded authoritative `Map`; force-evicted _active_ entries spill into a
    fixed-size count-min sketch that is read only for keys without a precise entry**
    (chosen).
 6. PostgreSQL-backed counters (deferred to SP-190; needed for multi-instance anyway).
@@ -77,8 +77,8 @@ Option 5.
   - per-IP and per-prefix caches can still evict under extreme pressure, weakening the
     spraying guard while per-email lock-outs hold;
   - all state is per process and lost on restart.
-  Further findings in this area are tracked against this ADR rather than iterated on
-  in memory; the durable fix is SP-190.
+    Further findings in this area are tracked against this ADR rather than iterated on
+    in memory; the durable fix is SP-190.
 - Follow-up: SP-190 moves all throttle state to PostgreSQL (shared across instances,
   survives restarts) and is a prerequisite for running more than one API instance
   (with SP-183).
