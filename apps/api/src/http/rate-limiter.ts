@@ -340,6 +340,7 @@ export function createAuthThrottle(
         secret: config.SESSION_SECRET,
         generationMs: windowMs * 4,
         now,
+        ...(options.onWarning ? { onAlert: options.onWarning } : {}),
       }),
       ...(options.onWarning ? { onWarning: options.onWarning } : {}),
     },
