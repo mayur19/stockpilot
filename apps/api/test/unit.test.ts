@@ -6,8 +6,11 @@ import {
   createAuthThrottle,
   createBackoffLimiter,
   createWindowLimiter,
+  ipv6Prefix48,
   normaliseIp,
+  PREFIX48_EMAIL_MULTIPLIER,
 } from '../src/http/rate-limiter.js';
+import { createFailureSketch } from '../src/http/count-min-sketch.js';
 import { canonicalTimezone } from '../src/modules/topology/topology.routes.js';
 import { parse } from '../src/http/validate.js';
 import { DUMMY_HASH, hashPassword, verifyPassword } from '../src/modules/auth/password.js';
@@ -136,6 +139,7 @@ describe('auth throttle', () => {
     LOGIN_IP_MAX_ATTEMPTS: 5,
     LOGIN_IP_MAX_EMAILS: 100,
     REGISTER_IP_MAX_ATTEMPTS: 2,
+    SESSION_SECRET: 'unit-test-secret'.padEnd(40, 'x'),
   };
 
   it('reserves attempts synchronously: a burst lets exactly N through', () => {
@@ -276,6 +280,106 @@ describe('auth throttle', () => {
     limiter.reserve('k');
     limiter.reset('k');
     expect(limiter.retryAfterMs('k')).toBe(0);
+  });
+});
+
+describe('lock-outs survive cache eviction (count-min sketch)', () => {
+  const config = {
+    LOGIN_MAX_ATTEMPTS: 3,
+    LOGIN_WINDOW_MINUTES: 15,
+    LOGIN_BACKOFF_BASE_SECONDS: 30,
+    LOGIN_IP_MAX_ATTEMPTS: 1_000_000,
+    LOGIN_IP_MAX_EMAILS: 1_000_000,
+    REGISTER_IP_MAX_ATTEMPTS: 2,
+    SESSION_SECRET: 'sketch-test-secret'.padEnd(40, 'x'),
+  };
+
+  it('a flood of new keys cannot clear a victim lock-out', () => {
+    let now = 0;
+    const warnings: string[] = [];
+    const throttle = createAuthThrottle(config, {
+      now: () => now,
+      capacity: 50,
+      onWarning: (event) => warnings.push(event),
+    });
+    for (let i = 0; i < 3; i += 1) throttle.reserveLogin(`10.0.0.${i}`, 'victim@x');
+    const lockedFor = throttle.reserveLogin('10.0.0.9', 'victim@x');
+    expect(lockedFor).toBeGreaterThan(0);
+    // Flood: thousands of distinct emails from many IPs push the victim out of every cache.
+    for (let i = 0; i < 5_000; i += 1) {
+      throttle.reserveLogin(`172.16.${i >> 8}.${i & 255}`, `flood${i}@x`);
+      now += 1;
+    }
+    expect(warnings.length).toBeGreaterThan(0);
+    expect(throttle.reserveLogin('10.0.0.9', 'victim@x')).toBeGreaterThan(0);
+  });
+
+  it('unrelated users are not blocked by the flood', () => {
+    let now = 0;
+    const throttle = createAuthThrottle(config, { now: () => now, capacity: 50 });
+    for (let i = 0; i < 5_000; i += 1) {
+      throttle.reserveLogin(`172.17.${i >> 8}.${i & 255}`, `flood${i}@x`);
+      now += 1;
+    }
+    let blocked = 0;
+    for (let i = 0; i < 200; i += 1) {
+      if (throttle.reserveLogin(`192.168.0.${i % 250}`, `real-user-${i}@example.test`) > 0)
+        blocked += 1;
+    }
+    expect(blocked).toBe(0);
+  });
+
+  it('a successful login stays cleared even though the sketch remembers', () => {
+    const throttle = createAuthThrottle(config, { now: () => 0 });
+    for (let i = 0; i < 3; i += 1) throttle.reserveLogin('10.1.1.1', 'user@x');
+    throttle.recordLoginSuccess('10.1.1.1', 'user@x');
+    expect(throttle.reserveLogin('10.1.1.1', 'user@x')).toBe(0);
+  });
+
+  it('caps new emails per IPv6 /48 across rotating /64s', () => {
+    const throttle = createAuthThrottle({ ...config, LOGIN_IP_MAX_EMAILS: 2 }, { now: () => 0 });
+    let admitted = 0;
+    for (let subnet = 0; subnet < 10; subnet += 1) {
+      for (let e = 0; e < 2; e += 1) {
+        if (
+          throttle.reserveLogin(`2001:db8:aa:${subnet.toString(16)}::1`, `s${subnet}e${e}@x`) === 0
+        )
+          admitted += 1;
+      }
+    }
+    expect(admitted).toBe(2 * PREFIX48_EMAIL_MULTIPLIER);
+    expect(ipv6Prefix48('2001:db8:aa:5::/64')).toBe('2001:db8:aa::/48');
+    expect(ipv6Prefix48('10.0.0.1')).toBeNull();
+  });
+});
+
+describe('failure sketch', () => {
+  it('never under-counts, decays after two generations, and keeps the latest time', () => {
+    let now = 1000;
+    const sketch = createFailureSketch({
+      secret: 's',
+      generationMs: 100,
+      depth: 4,
+      width: 64,
+      now: () => now,
+    });
+    for (let i = 0; i < 500; i += 1) sketch.record(`noise${i}`);
+    for (let i = 0; i < 3; i += 1) sketch.record('k');
+    const estimate = sketch.estimate('k');
+    expect(estimate.count).toBeGreaterThanOrEqual(3);
+    expect(estimate.lastAt).toBeGreaterThanOrEqual(1000);
+    now += 100;
+    expect(sketch.estimate('k').count).toBeGreaterThanOrEqual(3);
+    now += 100;
+    expect(sketch.estimate('k').count).toBe(0);
+    now += 250;
+    sketch.record('k');
+    expect(sketch.estimate('k').count).toBe(1);
+    expect(sketch.estimate('fresh-unrelated-key').count).toBe(0);
+  });
+
+  it('rejects invalid dimensions', () => {
+    expect(() => createFailureSketch({ secret: 's', generationMs: 1, depth: 0 })).toThrow();
   });
 });
 

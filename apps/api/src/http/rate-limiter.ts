@@ -13,10 +13,13 @@
  * await), so a burst of concurrent requests cannot all pass the check before the
  * first failure is recorded. A successful login gives its reservation back.
  *
- * Stores are bounded. When a store is full, a resumable cursor sweeps lapsed
- * entries across the whole map; only if every entry is still active is the entry
- * with the least time left evicted (and a warning emitted). New keys are never
- * refused just because the store is full, so filling it cannot lock users out.
+ * The per-email lock-out state lives in a fixed-size, non-evictable count-min
+ * sketch (count-min-sketch.ts, ADR-0020) which is the source of truth. The Maps
+ * below are bounded precision caches: when one is full a resumable cursor sweeps
+ * lapsed entries across the whole map and, if every entry is still active, the
+ * entry with the least time left is evicted with a warning. Eviction is safe
+ * because a returning key is re-seeded from the sketch, so a flood of new keys
+ * can neither lock everyone out nor clear a victim's lock-out.
  * Each normalised IP may also introduce only a limited number of distinct emails
  * per window, which bounds how fast one client can grow the per-email store.
  *
@@ -24,6 +27,8 @@
  * deployment in docs/operations/deployment.md. They must move to Postgres
  * (SP-183) before more than one API instance runs behind the proxy.
  */
+import { createFailureSketch, type FailureSketch } from './count-min-sketch.js';
+
 export type Clock = () => number;
 export type WarningSink = (event: string, detail: Record<string, unknown>) => void;
 
@@ -55,6 +60,10 @@ interface StoreRules {
   /** Remaining lifetime of an entry; it is stale (droppable) once this is <= 0. */
   readonly lifetimeLeft: (entry: Entry, now: number) => number;
   readonly onWarning?: WarningSink | undefined;
+  /** Durable state for keys missing from the cache (evicted or never cached). */
+  readonly seed?: ((key: string) => Entry | undefined) | undefined;
+  /** Called for every counted attempt so the durable layer stays in step. */
+  readonly onReserve?: ((key: string) => void) | undefined;
 }
 
 /**
@@ -141,8 +150,14 @@ function createLimiter(rules: StoreRules, now: Clock): Limiter {
     now,
     rules.onWarning,
   );
+  const current = (key: string): Entry | undefined => {
+    const cached = store.get(key);
+    if (cached) return cached;
+    const seeded = rules.seed?.(key);
+    return seeded && rules.lifetimeLeft(seeded, now()) > 0 ? seeded : undefined;
+  };
   const retryAfterMs = (key: string): number => {
-    const entry = store.get(key);
+    const entry = current(key);
     return entry ? Math.max(0, rules.waitFor(entry, now())) : 0;
   };
   return {
@@ -150,8 +165,9 @@ function createLimiter(rules: StoreRules, now: Clock): Limiter {
     reserve: (key) => {
       const wait = retryAfterMs(key);
       if (wait > 0) return wait;
-      const entry = store.get(key);
+      const entry = current(key);
       const at = now();
+      rules.onReserve?.(key);
       store.set(
         key,
         entry
@@ -166,7 +182,16 @@ function createLimiter(rules: StoreRules, now: Clock): Limiter {
       if (entry.count <= 1) store.delete(key);
       else store.set(key, { ...entry, count: entry.count - 1 });
     },
-    reset: (key) => store.delete(key),
+    // With a durable layer, a cleared key keeps a zero entry so the cache, not the
+    // sketch's historical count, is authoritative until that entry ages out.
+    reset: (key) => {
+      if (rules.seed) {
+        const at = now();
+        store.set(key, { count: 0, startedAt: at, lastAt: at });
+      } else {
+        store.delete(key);
+      }
+    },
     size: () => store.size(),
   };
 }
@@ -199,6 +224,8 @@ export interface BackoffOptions {
   readonly decayMs: number;
   readonly capacity?: number;
   readonly onWarning?: WarningSink;
+  /** Non-evictable failure sketch; when present it is the source of truth. */
+  readonly sketch?: FailureSketch;
 }
 
 export function createBackoffLimiter(options: BackoffOptions, now: Clock = Date.now): Limiter {
@@ -214,6 +241,15 @@ export function createBackoffLimiter(options: BackoffOptions, now: Clock = Date.
       capacity: options.capacity ?? DEFAULT_STORE_CAPACITY,
       onWarning: options.onWarning,
       waitFor,
+      seed: options.sketch
+        ? (key) => {
+            const { count, lastAt } = (options.sketch as FailureSketch).estimate(key);
+            return count > 0 ? { count, startedAt: lastAt, lastAt } : undefined;
+          }
+        : undefined,
+      onReserve: options.sketch
+        ? (key) => (options.sketch as FailureSketch).record(key)
+        : undefined,
       // Kept while locked out and until the failures have decayed.
       lifetimeLeft: (entry, at) =>
         Math.max(waitFor(entry, at), entry.lastAt + options.decayMs - at),
@@ -244,6 +280,12 @@ export function normaliseIp(raw: string | null | undefined): string {
   return `${prefix.join(':')}::/64`;
 }
 
+/** IPv6 /48 (typical site allocation) for a /64 key; IPv4 keys have none. */
+export function ipv6Prefix48(normalised: string): string | null {
+  if (!normalised.endsWith('::/64')) return null;
+  return `${normalised.slice(0, -'::/64'.length).split(':').slice(0, 3).join(':')}::/48`;
+}
+
 export interface AuthThrottle {
   /**
    * Reserves a login attempt for this IP and email before any I/O. Returns 0 when
@@ -263,7 +305,12 @@ export interface AuthThrottleConfig {
   readonly LOGIN_IP_MAX_ATTEMPTS: number;
   readonly LOGIN_IP_MAX_EMAILS: number;
   readonly REGISTER_IP_MAX_ATTEMPTS: number;
+  /** Keys the sketch HMAC so collisions cannot be targeted. */
+  readonly SESSION_SECRET: string;
 }
+
+/** A /48 may introduce this many times the per-/64 distinct-email allowance. */
+export const PREFIX48_EMAIL_MULTIPLIER = 4;
 
 export interface AuthThrottleOptions {
   readonly now?: Clock;
@@ -285,6 +332,11 @@ export function createAuthThrottle(
       maxDelayMs: windowMs,
       decayMs: windowMs * 4,
       capacity,
+      sketch: createFailureSketch({
+        secret: config.SESSION_SECRET,
+        generationMs: windowMs * 4,
+        now,
+      }),
       ...(options.onWarning ? { onWarning: options.onWarning } : {}),
     },
     now,
@@ -313,21 +365,33 @@ export function createAuthThrottle(
     options.onWarning,
   );
 
-  /** Wait imposed when this IP would introduce one distinct email too many. */
-  const emailFanOutWait = (ip: string, email: string): number => {
-    const seen = emailsByIp.get(ip);
-    if (!seen || seen.emails.has(email) || seen.emails.size < config.LOGIN_IP_MAX_EMAILS) return 0;
+  const fanOutWait = (key: string, email: string, cap: number): number => {
+    const seen = emailsByIp.get(key);
+    if (!seen || seen.emails.has(email) || seen.emails.size < cap) return 0;
     return seen.startedAt + windowMs - now();
   };
-  const noteEmail = (ip: string, email: string): void => {
-    const seen = emailsByIp.get(ip);
+  const noteEmail = (key: string, email: string): void => {
+    const seen = emailsByIp.get(key);
     if (seen?.emails.has(email)) return;
     emailsByIp.set(
-      ip,
+      key,
       seen
         ? { startedAt: seen.startedAt, emails: new Set([...seen.emails, email]) }
         : { startedAt: now(), emails: new Set([email]) },
     );
+  };
+  /** Wait imposed when this client (its /64 and, for IPv6, its /48) adds one email too many. */
+  const emailFanOutWait = (ip: string, email: string): number => {
+    const site = ipv6Prefix48(ip);
+    return Math.max(
+      fanOutWait(ip, email, config.LOGIN_IP_MAX_EMAILS),
+      site ? fanOutWait(site, email, config.LOGIN_IP_MAX_EMAILS * PREFIX48_EMAIL_MULTIPLIER) : 0,
+    );
+  };
+  const noteClientEmail = (ip: string, email: string): void => {
+    noteEmail(ip, email);
+    const site = ipv6Prefix48(ip);
+    if (site) noteEmail(site, email);
   };
 
   return {
@@ -340,7 +404,7 @@ export function createAuthThrottle(
         emailFanOutWait(ip, email),
       );
       if (wait > 0) return wait;
-      noteEmail(ip, email);
+      noteClientEmail(ip, email);
       byEmail.reserve(email);
       byIp.reserve(ip);
       return 0;
