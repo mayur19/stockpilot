@@ -1,25 +1,29 @@
 import { createHmac } from 'node:crypto';
 
 /**
- * Fixed-size, non-evictable failure sketch (ADR-0020).
+ * Fixed-size overflow sketch for evicted lock-outs (ADR-0020).
  *
- * A count-min sketch with `depth` rows of `width` counters, keyed by
- * HMAC(secret, key) so an attacker cannot aim collisions at a victim. It is the
- * durable source of truth for login lockouts: the precision Map in
- * rate-limiter.ts may evict entries under memory pressure, but a key that
- * returns is re-seeded from the sketch at (at least) its true strength.
+ * The precise per-email Map in rate-limiter.ts is authoritative. Only when it
+ * must force-evict an entry that is still active does that entry's failure count
+ * and latest failure time get absorbed here; the sketch is read only for keys
+ * that have no precise Map entry. Ordinary failures never touch it, so failures
+ * spread across many emails cannot lock out an untouched email, and a reset on
+ * successful login (a precise zero entry) always wins.
  *
- * - Counts: estimate = min over rows, which never under-counts. Collisions can
- *   only over-count, i.e. over-throttle one bucket, never unlock anyone.
- * - Last failure time: each cell keeps the max timestamp written to it; the
- *   estimate is the min over rows, which is never earlier than the true value.
- * - Windowed decay: two generations rotate every `generationMs`; failures older
- *   than two generations are forgotten. Memory is constant:
- *   depth x width x (2 x 4 + 8) bytes = 1 MiB for 4 x 16384.
+ * - Count-min: estimate = min over rows (never under-counts what was absorbed).
+ * - Latest failure: per-cell max, estimate = min over rows.
+ * - Keys are HMAC(secret, key) so collisions cannot be aimed at a victim.
+ * - Two rotating generations give windowed decay. Memory is constant
+ *   (4 x 16384 cells ~ 1 MiB).
+ * - Saturation guard: if any row is more than 50% occupied the sketch is ignored
+ *   for reads (it would start over-throttling unrelated users), an alert is
+ *   raised and `saturatedReads` is incremented.
  */
 export interface FailureSketch {
-  record(key: string): void;
-  estimate(key: string): { count: number; lastAt: number };
+  absorb(key: string, count: number, lastAt: number): void;
+  /** Null when nothing was absorbed for the key or the sketch is saturated. */
+  estimate(key: string): { count: number; lastAt: number } | null;
+  stats(): { saturatedReads: number; maxRowOccupancy: number };
 }
 
 export interface SketchOptions {
@@ -28,7 +32,10 @@ export interface SketchOptions {
   readonly depth?: number;
   readonly width?: number;
   readonly now?: () => number;
+  readonly onAlert?: (event: string, detail: Record<string, unknown>) => void;
 }
+
+export const SATURATION_THRESHOLD = 0.5;
 
 export function createFailureSketch(options: SketchOptions): FailureSketch {
   const depth = options.depth ?? 4;
@@ -36,21 +43,21 @@ export function createFailureSketch(options: SketchOptions): FailureSketch {
   const now = options.now ?? Date.now;
   if (depth < 1 || depth > 8 || width < 2) throw new Error('Invalid sketch dimensions');
 
-  let current = new Uint32Array(depth * width);
-  let previous = new Uint32Array(depth * width);
-  let lastAt = new Float64Array(depth * width);
+  const fresh = () => ({
+    counts: new Uint32Array(depth * width),
+    lastAt: new Float64Array(depth * width),
+    occupied: new Uint32Array(depth),
+  });
+  let current = fresh();
+  let previous = fresh();
   let generationStartedAt = now();
+  let saturatedReads = 0;
 
   const rotate = (): void => {
     const elapsed = now() - generationStartedAt;
     if (elapsed < options.generationMs) return;
-    if (elapsed >= 2 * options.generationMs) {
-      previous = new Uint32Array(depth * width);
-      lastAt = new Float64Array(depth * width);
-    } else {
-      previous = current;
-    }
-    current = new Uint32Array(depth * width);
+    previous = elapsed >= 2 * options.generationMs ? fresh() : current;
+    current = fresh();
     generationStartedAt = now();
   };
 
@@ -62,24 +69,41 @@ export function createFailureSketch(options: SketchOptions): FailureSketch {
     );
   };
 
+  /** Upper bound on the occupied fraction of the fullest row across both generations. */
+  const maxRowOccupancy = (): number => {
+    let max = 0;
+    for (let row = 0; row < depth; row += 1) {
+      max = Math.max(max, ((current.occupied[row] ?? 0) + (previous.occupied[row] ?? 0)) / width);
+    }
+    return max;
+  };
+
   return {
-    record: (key) => {
+    absorb: (key, count, lastAt) => {
       rotate();
-      const at = now();
-      for (const cell of cells(key)) {
-        current[cell] = Math.min((current[cell] ?? 0) + 1, 0xffffffff);
-        lastAt[cell] = Math.max(lastAt[cell] ?? 0, at);
-      }
+      cells(key).forEach((cell, row) => {
+        const before = current.counts[cell] ?? 0;
+        if (before === 0) current.occupied[row] = (current.occupied[row] ?? 0) + 1;
+        current.counts[cell] = Math.min(before + count, 0xffffffff);
+        current.lastAt[cell] = Math.max(current.lastAt[cell] ?? 0, lastAt);
+      });
     },
     estimate: (key) => {
       rotate();
+      const occupancy = maxRowOccupancy();
+      if (occupancy > SATURATION_THRESHOLD) {
+        saturatedReads += 1;
+        options.onAlert?.('throttle_sketch_saturated', { occupancy, saturatedReads });
+        return null;
+      }
       let count = Infinity;
       let last = Infinity;
       for (const cell of cells(key)) {
-        count = Math.min(count, (current[cell] ?? 0) + (previous[cell] ?? 0));
-        last = Math.min(last, lastAt[cell] ?? 0);
+        count = Math.min(count, (current.counts[cell] ?? 0) + (previous.counts[cell] ?? 0));
+        last = Math.min(last, Math.max(current.lastAt[cell] ?? 0, previous.lastAt[cell] ?? 0));
       }
-      return { count: count === Infinity ? 0 : count, lastAt: last === Infinity ? 0 : last };
+      return count > 0 && count !== Infinity ? { count, lastAt: last } : null;
     },
+    stats: () => ({ saturatedReads, maxRowOccupancy: maxRowOccupancy() }),
   };
 }

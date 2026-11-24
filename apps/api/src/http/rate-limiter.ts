@@ -13,13 +13,13 @@
  * await), so a burst of concurrent requests cannot all pass the check before the
  * first failure is recorded. A successful login gives its reservation back.
  *
- * The per-email lock-out state lives in a fixed-size, non-evictable count-min
- * sketch (count-min-sketch.ts, ADR-0020) which is the source of truth. The Maps
- * below are bounded precision caches: when one is full a resumable cursor sweeps
- * lapsed entries across the whole map and, if every entry is still active, the
- * entry with the least time left is evicted with a warning. Eviction is safe
- * because a returning key is re-seeded from the sketch, so a flood of new keys
- * can neither lock everyone out nor clear a victim's lock-out.
+ * The Maps below are bounded and authoritative. When one is full a resumable
+ * cursor sweeps lapsed entries across the whole map and, if every entry is still
+ * active, the entry with the least time left is evicted with a warning. For the
+ * per-email store an evicted *active* entry is absorbed into a fixed-size
+ * count-min sketch (count-min-sketch.ts, ADR-0020), which is consulted only for
+ * keys with no precise entry, so a flood of new keys can neither lock everyone
+ * out nor clear a victim's lock-out.
  * Each normalised IP may also introduce only a limited number of distinct emails
  * per window, which bounds how fast one client can grow the per-email store.
  *
@@ -62,8 +62,8 @@ interface StoreRules {
   readonly onWarning?: WarningSink | undefined;
   /** Durable state for keys missing from the cache (evicted or never cached). */
   readonly seed?: ((key: string) => Entry | undefined) | undefined;
-  /** Called for every counted attempt so the durable layer stays in step. */
-  readonly onReserve?: ((key: string) => void) | undefined;
+  /** Receives active entries that had to be force-evicted. */
+  readonly onEvict?: ((key: string, entry: Entry) => void) | undefined;
 }
 
 /**
@@ -77,6 +77,7 @@ export function createBoundedStore<V>(
   lifetimeLeft: (value: V, now: number) => number,
   now: Clock,
   onWarning?: WarningSink,
+  onEvict?: (key: string, value: V) => void,
 ) {
   const entries = new Map<string, V>();
   let cursor: Iterator<[string, V]> | null = null;
@@ -99,17 +100,18 @@ export function createBoundedStore<V>(
 
   const evictLeastTimeLeft = (): void => {
     const at = now();
-    let victim: string | null = null;
+    let victim: [string, V] | null = null;
     let least = Infinity;
     for (const [key, value] of entries) {
       const left = lifetimeLeft(value, at);
       if (left < least) {
         least = left;
-        victim = key;
+        victim = [key, value];
       }
     }
     if (victim !== null) {
-      entries.delete(victim);
+      entries.delete(victim[0]);
+      onEvict?.(victim[0], victim[1]);
       onWarning?.('throttle_store_full', { store: name, capacity, evictedMsLeft: least });
     }
   };
@@ -149,6 +151,7 @@ function createLimiter(rules: StoreRules, now: Clock): Limiter {
     rules.lifetimeLeft,
     now,
     rules.onWarning,
+    rules.onEvict,
   );
   const current = (key: string): Entry | undefined => {
     const cached = store.get(key);
@@ -167,7 +170,6 @@ function createLimiter(rules: StoreRules, now: Clock): Limiter {
       if (wait > 0) return wait;
       const entry = current(key);
       const at = now();
-      rules.onReserve?.(key);
       store.set(
         key,
         entry
@@ -224,7 +226,7 @@ export interface BackoffOptions {
   readonly decayMs: number;
   readonly capacity?: number;
   readonly onWarning?: WarningSink;
-  /** Non-evictable failure sketch; when present it is the source of truth. */
+  /** Overflow sketch for force-evicted active entries; read only for uncached keys. */
   readonly sketch?: FailureSketch;
 }
 
@@ -243,12 +245,14 @@ export function createBackoffLimiter(options: BackoffOptions, now: Clock = Date.
       waitFor,
       seed: options.sketch
         ? (key) => {
-            const { count, lastAt } = (options.sketch as FailureSketch).estimate(key);
-            return count > 0 ? { count, startedAt: lastAt, lastAt } : undefined;
+            const absorbed = (options.sketch as FailureSketch).estimate(key);
+            return absorbed
+              ? { count: absorbed.count, startedAt: absorbed.lastAt, lastAt: absorbed.lastAt }
+              : undefined;
           }
         : undefined,
-      onReserve: options.sketch
-        ? (key) => (options.sketch as FailureSketch).record(key)
+      onEvict: options.sketch
+        ? (key, entry) => (options.sketch as FailureSketch).absorb(key, entry.count, entry.lastAt)
         : undefined,
       // Kept while locked out and until the failures have decayed.
       lifetimeLeft: (entry, at) =>

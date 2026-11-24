@@ -229,16 +229,24 @@ export async function adjustStock(
 
 /** Re-folds the whole ledger and compares it with the stored projection (SP-041). */
 export async function verifyProjection(ctx: AppContext, orgId: string) {
-  const [ledger, stored] = await Promise.all([
-    loadLedger(ctx.db, orgId),
-    loadStoredBalances(ctx.db, orgId),
-  ]);
-  const projected = projectBalances(ledger);
-  const mismatches = diffBalances(projected, stored);
-  return {
-    consistent: mismatches.length === 0,
-    movementCount: ledger.length,
-    balanceCount: stored.length,
-    mismatches,
-  };
+  // One REPEATABLE READ snapshot so concurrent writes cannot produce phantom drift.
+  const client = await ctx.db.connect();
+  try {
+    await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
+    const ledger = await loadLedger(client, orgId);
+    const stored = await loadStoredBalances(client, orgId);
+    await client.query('COMMIT');
+    const mismatches = diffBalances(projectBalances(ledger), stored);
+    return {
+      consistent: mismatches.length === 0,
+      movementCount: ledger.length,
+      balanceCount: stored.length,
+      mismatches,
+    };
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
 }
