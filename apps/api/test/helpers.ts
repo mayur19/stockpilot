@@ -22,6 +22,7 @@ export function testEnv(overrides: Partial<Record<keyof Env, string>> = {}): Env
     LOG_LEVEL: 'silent',
     REGISTER_IP_MAX_ATTEMPTS: '1000',
     LOGIN_IP_MAX_ATTEMPTS: '1000',
+    LOGIN_IP_MAX_EMAILS: '1000',
     ...overrides,
   });
 }

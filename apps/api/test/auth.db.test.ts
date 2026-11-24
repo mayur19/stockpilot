@@ -135,10 +135,28 @@ describe.skipIf(!hasDatabase)('auth & sessions (database)', () => {
     expect(blocked.json().error.details.retryAfterSeconds).toBeGreaterThan(0);
   });
 
-  it('blocks an IP spraying one password across many accounts (IP limiter)', async () => {
-    const victims = await Promise.all(
-      [1, 2, 3, 4].map((i) => registerOrg(server.app, `spray${i}`)),
+  it('lets at most N of 20 concurrent bad logins past the throttle', async () => {
+    const owner = await registerOrg(server.app, 'burst');
+    const results = await Promise.all(
+      Array.from({ length: 20 }, (_, i) =>
+        server.app.inject({
+          method: 'POST',
+          url: '/api/v1/auth/login',
+          remoteAddress: `10.30.0.${i}`,
+          payload: { email: owner.email, password: 'wrong-password-123' },
+        }),
+      ),
     );
+    const statuses = results.map((r) => r.statusCode);
+    // LOGIN_MAX_ATTEMPTS is 3 for this suite: three verifications, the rest throttled.
+    expect(statuses.filter((s) => s === 401)).toHaveLength(3);
+    expect(statuses.filter((s) => s === 429)).toHaveLength(17);
+  });
+
+  it('blocks an IP spraying one password across many accounts (IP limiter)', async () => {
+    // Sequential: in-flight logins count against the per-IP limit until they succeed.
+    const victims = [];
+    for (const i of [1, 2, 3, 4]) victims.push(await registerOrg(server.app, `spray${i}`));
     const spray = (email: string) =>
       server.app.inject({
         method: 'POST',

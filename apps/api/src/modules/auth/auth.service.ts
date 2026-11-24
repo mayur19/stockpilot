@@ -77,11 +77,10 @@ export async function registerOwner(
   client: ClientInfo,
 ): Promise<{ status: 'accepted'; message: string }> {
   const ip = client.ip ?? 'unknown';
-  const retryAfterMs = ctx.throttle.registerRetryAfterMs(ip);
+  const retryAfterMs = ctx.throttle.reserveRegistration(ip);
   if (retryAfterMs > 0) {
     throw tooManyRequests('Too many registration attempts, try again later', retryAfterMs);
   }
-  ctx.throttle.recordRegistration(ip);
   const passwordHash = await hashPassword(input.password);
   try {
     await withTransaction(ctx.db, async (tx) => {
@@ -127,14 +126,15 @@ export async function login(
   client: ClientInfo,
 ): Promise<IssuedSession> {
   const ip = client.ip ?? 'unknown';
-  const retryAfterMs = ctx.throttle.loginRetryAfterMs(ip, input.email);
+  // Reserved synchronously, before the first await, so concurrent attempts cannot
+  // all slip past the check; the reservation counts as a failure until it succeeds.
+  const retryAfterMs = ctx.throttle.reserveLogin(ip, input.email);
   if (retryAfterMs > 0) {
     throw tooManyRequests('Too many failed login attempts, try again later', retryAfterMs);
   }
   const user = await repo.findUserByEmail(ctx.db, input.email);
   const valid = await verifyPassword(input.password, user?.password_hash ?? DUMMY_HASH);
   if (!user || !valid || !user.is_active) {
-    ctx.throttle.recordLoginFailure(ip, input.email);
     await recordAudit(ctx.db, {
       organizationId: user?.organization_id ?? null,
       actorUserId: null,
@@ -145,7 +145,7 @@ export async function login(
     });
     throw new AppError(401, 'INVALID_CREDENTIALS', 'Email or password is incorrect');
   }
-  ctx.throttle.recordLoginSuccess(input.email);
+  ctx.throttle.recordLoginSuccess(ip, input.email);
   await repo.touchLogin(ctx.db, user.id);
   await recordAudit(ctx.db, {
     organizationId: user.organization_id,

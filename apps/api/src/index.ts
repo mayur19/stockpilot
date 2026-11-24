@@ -6,7 +6,11 @@ import { createAuthThrottle } from './http/rate-limiter.js';
 async function main(): Promise<void> {
   const env = loadEnv();
   const db = createPool(env);
-  const app = buildApp({ env, db, throttle: createAuthThrottle(env) });
+  const throttle = createAuthThrottle(env, {
+    onWarning: (event, detail) =>
+      app.log.warn({ event, ...detail }, 'auth throttle store under pressure'),
+  });
+  const app = buildApp({ env, db, throttle });
 
   const shutdown = async (signal: string) => {
     app.log.info({ signal }, 'shutting down');

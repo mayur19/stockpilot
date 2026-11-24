@@ -18,6 +18,7 @@ const envSchema = z.object({
   LOGIN_WINDOW_MINUTES: z.coerce.number().int().min(1).max(1440).default(15),
   LOGIN_BACKOFF_BASE_SECONDS: z.coerce.number().int().min(1).max(3600).default(30),
   LOGIN_IP_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(10_000).default(50),
+  LOGIN_IP_MAX_EMAILS: z.coerce.number().int().min(1).max(10_000).default(20),
   REGISTER_IP_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(1000).default(10),
   /**
    * Reverse-proxy trust for X-Forwarded-For: "false" (default), a hop count such as
@@ -27,8 +28,9 @@ const envSchema = z.object({
   TRUST_PROXY: z
     .string()
     .trim()
-    .default('false')
-    .transform((value, issue): TrustProxy => {
+    .optional()
+    .transform((input, issue): TrustProxy => {
+      const value = input ?? 'false';
       if (value === '' || value === 'false') return false;
       if (/^\d{1,2}$/.test(value)) return Number(value);
       const entries = value
@@ -57,6 +59,11 @@ export function loadEnv(source: NodeJS.ProcessEnv = process.env): Env {
   if (!parsed.success) {
     const issues = parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ');
     throw new Error(`Invalid configuration: ${issues}`);
+  }
+  if (parsed.data.NODE_ENV === 'production' && source.TRUST_PROXY === undefined) {
+    throw new Error(
+      'Invalid configuration: TRUST_PROXY must be set explicitly in production (false, a hop count, or proxy IPs/CIDRs)',
+    );
   }
   if (parsed.data.NODE_ENV === 'production' && /replace-me/.test(parsed.data.SESSION_SECRET)) {
     throw new Error('Invalid configuration: SESSION_SECRET still has the placeholder value');

@@ -6,6 +6,7 @@ import {
   createAuthThrottle,
   createBackoffLimiter,
   createWindowLimiter,
+  normaliseIp,
 } from '../src/http/rate-limiter.js';
 import { canonicalTimezone } from '../src/modules/topology/topology.routes.js';
 import { parse } from '../src/http/validate.js';
@@ -36,6 +37,7 @@ describe('loadEnv', () => {
       loadEnv({
         ...baseEnv,
         NODE_ENV: 'production',
+        TRUST_PROXY: 'false',
         SESSION_SECRET: 'replace-me-with-a-long-random-local-only-value',
       }),
     ).toThrow(/placeholder/);
@@ -115,8 +117,14 @@ describe('TRUST_PROXY', () => {
     expect(() => loadEnv({ ...baseEnv, TRUST_PROXY: 'everyone' })).toThrow(/TRUST_PROXY/);
   });
 
-  it('does not derive proxy trust from NODE_ENV', () => {
-    expect(loadEnv({ ...baseEnv, NODE_ENV: 'production' }).TRUST_PROXY).toBe(false);
+  it('requires an explicit TRUST_PROXY in production and never derives it from NODE_ENV', () => {
+    expect(() => loadEnv({ ...baseEnv, NODE_ENV: 'production' })).toThrow(
+      /TRUST_PROXY must be set/,
+    );
+    expect(loadEnv({ ...baseEnv, NODE_ENV: 'production', TRUST_PROXY: 'false' }).TRUST_PROXY).toBe(
+      false,
+    );
+    expect(loadEnv({ ...baseEnv, NODE_ENV: 'production', TRUST_PROXY: '1' }).TRUST_PROXY).toBe(1);
   });
 });
 
@@ -126,80 +134,160 @@ describe('auth throttle', () => {
     LOGIN_WINDOW_MINUTES: 15,
     LOGIN_BACKOFF_BASE_SECONDS: 30,
     LOGIN_IP_MAX_ATTEMPTS: 5,
+    LOGIN_IP_MAX_EMAILS: 100,
     REGISTER_IP_MAX_ATTEMPTS: 2,
   };
 
+  it('reserves attempts synchronously: a burst lets exactly N through', () => {
+    const throttle = createAuthThrottle(
+      { ...config, LOGIN_IP_MAX_ATTEMPTS: 1000 },
+      { now: () => 0 },
+    );
+    const passed = Array.from({ length: 20 }, (_, i) =>
+      throttle.reserveLogin(`ip${i}`, 'a@x'),
+    ).filter((wait) => wait === 0);
+    expect(passed).toHaveLength(3);
+  });
+
   it('applies progressive backoff per email regardless of IP', () => {
     let now = 0;
-    const throttle = createAuthThrottle(config, () => now);
-    for (let i = 0; i < 2; i += 1) throttle.recordLoginFailure(`ip${i}`, 'a@x');
-    expect(throttle.loginRetryAfterMs('ip9', 'a@x')).toBe(0);
-    throttle.recordLoginFailure('ip2', 'a@x');
-    expect(throttle.loginRetryAfterMs('ip9', 'a@x')).toBe(30_000);
+    const throttle = createAuthThrottle(config, { now: () => now });
+    for (let i = 0; i < 3; i += 1) expect(throttle.reserveLogin(`10.0.0.${i}`, 'a@x')).toBe(0);
+    expect(throttle.reserveLogin('10.0.0.9', 'a@x')).toBe(30_000);
     now = 30_000;
-    expect(throttle.loginRetryAfterMs('ip9', 'a@x')).toBe(0);
-    throttle.recordLoginFailure('ip3', 'a@x');
-    expect(throttle.loginRetryAfterMs('ip9', 'a@x')).toBe(60_000);
-    now = 60_000;
-    throttle.recordLoginFailure('ip4', 'a@x');
-    expect(throttle.loginRetryAfterMs('ip9', 'a@x')).toBe(120_000);
-    throttle.recordLoginSuccess('a@x');
-    expect(throttle.loginRetryAfterMs('ip9', 'a@x')).toBe(0);
+    expect(throttle.reserveLogin('10.0.0.9', 'a@x')).toBe(0);
+    expect(throttle.reserveLogin('10.0.0.8', 'a@x')).toBe(60_000);
+    now = 90_000;
+    expect(throttle.reserveLogin('10.0.0.8', 'a@x')).toBe(0);
+    expect(throttle.reserveLogin('10.0.0.7', 'a@x')).toBe(120_000);
+    throttle.recordLoginSuccess('10.0.0.8', 'a@x');
+    expect(throttle.reserveLogin('10.0.0.7', 'a@x')).toBe(0);
   });
 
   it('caps the backoff at the login window', () => {
     let now = 0;
-    const throttle = createAuthThrottle(config, () => now);
-    for (let i = 0; i < 30; i += 1) {
-      throttle.recordLoginFailure(`ip${i}`, 'b@x');
-      now += 1;
+    const throttle = createAuthThrottle(
+      { ...config, LOGIN_IP_MAX_ATTEMPTS: 1000 },
+      { now: () => now },
+    );
+    for (let i = 0; i < 40; i += 1) {
+      const wait = throttle.reserveLogin(`10.1.0.${i}`, 'b@x');
+      expect(wait).toBeLessThanOrEqual(15 * 60_000);
+      now += wait;
     }
-    expect(throttle.loginRetryAfterMs('ipZ', 'b@x')).toBeLessThanOrEqual(15 * 60_000);
   });
 
-  it('throttles an IP spraying many accounts and keeps it after a success', () => {
+  it('throttles an IP spraying many accounts; success frees only its own slot', () => {
     let now = 0;
-    const throttle = createAuthThrottle(config, () => now);
-    for (let i = 0; i < 5; i += 1) throttle.recordLoginFailure('1.2.3.4', `user${i}@x`);
-    expect(throttle.loginRetryAfterMs('1.2.3.4', 'fresh@x')).toBeGreaterThan(0);
-    throttle.recordLoginSuccess('fresh@x');
-    expect(throttle.loginRetryAfterMs('1.2.3.4', 'fresh@x')).toBeGreaterThan(0);
-    expect(throttle.loginRetryAfterMs('5.6.7.8', 'fresh@x')).toBe(0);
+    const throttle = createAuthThrottle(config, { now: () => now });
+    for (let i = 0; i < 5; i += 1) expect(throttle.reserveLogin('1.2.3.4', `user${i}@x`)).toBe(0);
+    expect(throttle.reserveLogin('1.2.3.4', 'fresh@x')).toBeGreaterThan(0);
+    expect(throttle.reserveLogin('5.6.7.8', 'fresh@x')).toBe(0);
+    throttle.recordLoginSuccess('1.2.3.4', 'user0@x');
+    expect(throttle.reserveLogin('1.2.3.4', 'fresh@x')).toBe(0);
+    expect(throttle.reserveLogin('1.2.3.4', 'other@x')).toBeGreaterThan(0);
     now = 15 * 60_000;
-    expect(throttle.loginRetryAfterMs('1.2.3.4', 'fresh@x')).toBe(0);
+    expect(throttle.reserveLogin('1.2.3.4', 'other@x')).toBe(0);
+  });
+
+  it('caps distinct emails per normalised IP per window', () => {
+    const throttle = createAuthThrottle(
+      { ...config, LOGIN_IP_MAX_ATTEMPTS: 1000, LOGIN_IP_MAX_EMAILS: 3 },
+      { now: () => 0 },
+    );
+    for (let i = 0; i < 3; i += 1)
+      expect(throttle.reserveLogin('2001:db8:1:2::5', `e${i}@x`)).toBe(0);
+    expect(throttle.reserveLogin('2001:db8:1:2::99', 'e9@x')).toBeGreaterThan(0);
+    expect(throttle.reserveLogin('2001:db8:1:2::99', 'e1@x')).toBe(0);
   });
 
   it('limits registrations per IP per hour', () => {
     let now = 0;
-    const throttle = createAuthThrottle(config, () => now);
-    throttle.recordRegistration('ip');
-    throttle.recordRegistration('ip');
-    expect(throttle.registerRetryAfterMs('ip')).toBe(3_600_000);
+    const throttle = createAuthThrottle(config, { now: () => now });
+    expect(throttle.reserveRegistration('::ffff:9.9.9.9')).toBe(0);
+    expect(throttle.reserveRegistration('9.9.9.9')).toBe(0);
+    expect(throttle.reserveRegistration('9.9.9.9')).toBe(3_600_000);
     now = 3_600_000;
-    expect(throttle.registerRetryAfterMs('ip')).toBe(0);
+    expect(throttle.reserveRegistration('9.9.9.9')).toBe(0);
   });
 
-  it('forgets stale email failures after the decay period', () => {
+  it('never locks out new keys when the store is full; evicts least time left with a warning', () => {
+    let now = 0;
+    const warnings: string[] = [];
+    const limiter = createBackoffLimiter(
+      {
+        freeAttempts: 1,
+        baseDelayMs: 1000,
+        maxDelayMs: 100_000,
+        decayMs: 1000,
+        capacity: 3,
+        onWarning: (event) => warnings.push(event),
+      },
+      () => now,
+    );
+    for (const key of ['a', 'b', 'c']) {
+      limiter.reserve(key);
+      now += 10;
+    }
+    // All three are active (locked out); a new key still gets in immediately.
+    expect(limiter.reserve('d')).toBe(0);
+    expect(limiter.size()).toBe(3);
+    expect(warnings).toEqual(['throttle_store_full']);
+    // The entry with the least time left ('a', oldest) was evicted; others kept their lock.
+    expect(limiter.retryAfterMs('a')).toBe(0);
+    expect(limiter.retryAfterMs('c')).toBeGreaterThan(0);
+  });
+
+  it('sweeps lapsed entries before evicting anything', () => {
+    let now = 0;
+    const warnings: string[] = [];
+    const limiter = createWindowLimiter(
+      1,
+      1000,
+      () => now,
+      2,
+      (event) => warnings.push(event),
+    );
+    limiter.reserve('old');
+    now = 900;
+    limiter.reserve('young');
+    now = 1000;
+    expect(limiter.reserve('new')).toBe(0);
+    expect(warnings).toEqual([]);
+    expect(limiter.retryAfterMs('young')).toBeGreaterThan(0);
+  });
+
+  it('forgets stale failures after the decay period and supports release/reset', () => {
     let now = 0;
     const limiter = createBackoffLimiter(
       { freeAttempts: 1, baseDelayMs: 10, maxDelayMs: 100, decayMs: 1000 },
       () => now,
     );
-    limiter.hit('k');
+    limiter.reserve('k');
     expect(limiter.retryAfterMs('k')).toBe(10);
     now = 1000;
     expect(limiter.retryAfterMs('k')).toBe(0);
-    limiter.hit('k');
+    limiter.reserve('k');
+    limiter.reserve('k');
+    limiter.release('k');
+    limiter.release('k');
+    limiter.release('missing');
+    expect(limiter.size()).toBe(0);
+    limiter.reserve('k');
     limiter.reset('k');
     expect(limiter.retryAfterMs('k')).toBe(0);
   });
+});
 
-  it('window limiter resets', () => {
-    const limiter = createWindowLimiter(1, 1000, () => 0);
-    limiter.hit('k');
-    expect(limiter.retryAfterMs('k')).toBe(1000);
-    limiter.reset('k');
-    expect(limiter.retryAfterMs('k')).toBe(0);
+describe('normaliseIp', () => {
+  it('collapses mapped IPv4 and reduces IPv6 to /64', () => {
+    expect(normaliseIp('::ffff:10.0.0.1')).toBe('10.0.0.1');
+    expect(normaliseIp(' 10.0.0.1 ')).toBe('10.0.0.1');
+    expect(normaliseIp('2001:DB8:0001:0002:aaaa::1')).toBe('2001:db8:1:2::/64');
+    expect(normaliseIp('2001:db8:1:2::ffff')).toBe('2001:db8:1:2::/64');
+    expect(normaliseIp('::1')).toBe('0:0:0:0::/64');
+    expect(normaliseIp('')).toBe('unknown');
+    expect(normaliseIp(null)).toBe('unknown');
   });
 });
 
