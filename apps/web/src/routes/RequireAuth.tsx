@@ -1,0 +1,11 @@
+import type { ReactNode } from 'react';
+import { Navigate, useLocation } from 'react-router-dom';
+import { useAuth } from '../auth/useAuth';
+
+export function RequireAuth({ children }: { children: ReactNode }) {
+  const { current, loading } = useAuth();
+  const location = useLocation();
+  if (loading) return <p className="muted center">Loading…</p>;
+  if (!current) return <Navigate to="/login" replace state={{ from: location.pathname }} />;
+  return <>{children}</>;
+}
