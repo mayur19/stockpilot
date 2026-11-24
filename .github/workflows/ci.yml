@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    env:
+      # The runner ships PostgreSQL; we start it natively (no containers).
+      TEST_DATABASE_URL: postgresql://stockpilot:stockpilot-ci@localhost:5432/stockpilot_test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Start the runner's PostgreSQL
+        run: |
+          sudo systemctl start postgresql.service
+          pg_isready --timeout=30
+          sudo -u postgres psql -v ON_ERROR_STOP=1 -c "CREATE ROLE stockpilot LOGIN PASSWORD 'stockpilot-ci'"
+          sudo -u postgres psql -v ON_ERROR_STOP=1 -c "CREATE DATABASE stockpilot_test OWNER stockpilot"
+          psql "$TEST_DATABASE_URL" -Atc 'SELECT version()'
+
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run format:check
+      - run: npm run typecheck
+      - run: npm run test:coverage
+      - run: npm run build
+
+      - name: Migration + seed smoke test
+        env:
+          DATABASE_URL: ${{ env.TEST_DATABASE_URL }}
+          SESSION_SECRET: ci-only-session-secret-0123456789abcdef
+        run: npm run db:reset
